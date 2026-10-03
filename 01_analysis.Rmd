@@ -1,0 +1,1304 @@
+---
+title: "Mammal occupancy analysis"
+output:
+  html_document:
+    toc: true
+    code_folding: show
+---
+
+Run this document from top to bottom once. It saves `results/analysis_results.rds`.
+Then open `02_figures.Rmd` to edit figures without rerunning these analyses.
+
+## 1. Packages and directories
+
+Open `Mammals_analysis.Rproj` first, then run this document in a fresh R
+session. Paths are relative to the extracted archive folder; no personal
+computer path is required. When knitting, R Markdown uses this Rmd's folder.
+If working without an RStudio project, set your working directory to the
+folder containing this document before running chunks.
+
+Input tables are in `to rerun the archived code/`. Daily detections, survey
+dates, and the site-ordering table are in its `detection data/` subfolder.
+The setup checks that all required input files are present.
+
+CSV tables are written to `results/tables/`. Rerunning the analysis replaces
+these outputs and, after successful completion, the saved RDS file.
+
+```{r setup}
+knitr::opts_chunk$set(echo = TRUE, error = FALSE, cache = FALSE)
+library(unmarked)
+library(dplyr)
+library(tidyr)
+library(vegan)
+library(e1071)
+library(pairwiseAdonis)
+
+# Only the four directories used by this analysis; all paths are relative.
+data_dir <- "to rerun the archived code"
+detection_dir <- file.path(data_dir, "detection data")
+results_dir <- "results"
+tables_dir <- file.path(results_dir, "tables")
+
+required_inputs <- c(
+  "Corrected_Fire_Metrics_6-11-26.csv",
+  "detection data/det_his_forordering.csv",
+  "detection data/survey_visit_dates_julian_day_level_correct.csv",
+  "detection data/y_American_Black_Bear.csv",
+  "detection data/y_California_Ground_Squirrel.csv",
+  "detection data/y_Coyote.csv",
+  "detection data/y_Douglas's_Squirrel.csv",
+  "detection data/y_Golden_Mantled_Ground_Squirrel.csv",
+  "detection data/y_Grey_Fox.csv",
+  "detection data/y_Mule_Deer.csv",
+  "detection data/y_Striped_Skunk.csv",
+  "detection data/y_Western_Gray_Squirrel.csv",
+  "filtered_deployments_detailed_func_dates3.csv",
+  "Full_EnvCovariates_ForWildlife_Dec17-25.csv",
+  "images_2007979.csv",
+  "Mammals_groups.csv",
+  "plot_fire_metrics_1_rev_05082026.csv",
+  "plot_fire_metrics_suppl_4_061126.csv",
+  "plot_info_2025.csv",
+  "plot_info_with_topographic_data.csv",
+  "plot_level_means_fuentes_inputs.csv",
+  "struc_from_veg_analysis.csv"
+)
+missing_inputs <- required_inputs[!file.exists(file.path(data_dir, required_inputs))]
+if (length(missing_inputs)) {
+  stop("Missing archive inputs. Open Mammals_analysis.Rproj (or set the working directory to this archive). Missing files: ",
+       paste(missing_inputs, collapse = ", "))
+}
+
+dir.create(tables_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(file.path(tables_dir, "model predictions"), showWarnings = FALSE)
+dir.create(file.path(tables_dir, "simulations"), showWarnings = FALSE)
+set.seed(123)
+```
+
+## 2. Prepare the model inputs
+
+The ordering table defines the included deployments and the row order used throughout the analysis.
+
+```{r site-order}
+det_his_forordering <- read.csv(file.path(detection_dir, "det_his_forordering.csv"))
+stopifnot(!anyNA(det_his_forordering$deployment_id),
+          !anyDuplicated(det_his_forordering$deployment_id))
+```
+
+Use the same vegetation variables and transformations as in the original document.
+
+```{r vegetation-transformations}
+struc <- read.csv(file.path(data_dir, "struc_from_veg_analysis.csv")) %>% dplyr::select("X.1", "lg_snag_ha", "dens_lg", "dens_md", "cwd_m3_", "fuel_kgha",
+  "gr.mean.percent.shrub", "gr.mean.percent.herbGrass", "mean_cc_90", "vert_div",
+  "tree_rich", "herb_rich", "shrub_rich",
+  "Snag_Density_Diameter_Med_per_Hectare",
+  "Densiometer_CV",
+  "Tree.Density.Diameter.Class.Saplings.Hectare",
+  "Tree.Density.Diameter.Class.Small.Hectare")
+nrow(struc)
+site_cov  <- read.csv(file.path(data_dir, "Full_EnvCovariates_ForWildlife_Dec17-25.csv")) %>% dplyr::select(Plot, y_ca_alb)
+
+nrow(site_cov)
+struc <- merge(struc, site_cov, by.x = "X.1", by.y="Plot", all.x=T)
+nrow(struc)
+
+struc <- struc[match(det_his_forordering$plot_id, struc$X.1), ]
+struc$herb_rich <- log1p(struc$herb_rich)
+struc$cwd_m3_ <- log1p(struc$cwd_m3_)
+struc$lg_snag_ha <- log1p(struc$lg_snag_ha)
+struc$Tree.Density.Diameter.Class.Saplings.Hectare <- log1p(struc$Tree.Density.Diameter.Class.Saplings.Hectare)
+struc$Tree.Density.Diameter.Class.Small.Hectare <- log1p(struc$Tree.Density.Diameter.Class.Small.Hectare)
+
+struc$gr.mean.percent.shrub <- sqrt(struc$gr.mean.percent.shrub)
+struc$gr.mean.percent.herbGrass <- sqrt(struc$gr.mean.percent.herbGrass)
+
+struc$vert_div <- bestNormalize::bestNormalize(struc$vert_div)$x.t
+struc$Snag_Density_Diameter_Med_per_Hectare <- bestNormalize::bestNormalize(struc$Snag_Density_Diameter_Med_per_Hectare)$x.t
+setdiff(det_his_forordering$plot_id, struc$X.1)
+
+struc <- struc[match(det_his_forordering$plot_id, struc$X.1), ]
+```
+
+Survey dates are scaled across all sites and visits, as in your original code.
+
+```{r survey-dates}
+dates <- read.csv(file.path(detection_dir, "survey_visit_dates_julian_day_level_correct.csv"))
+setdiff(dates$deployment_id, det_his_forordering$deployment_id)
+dates <- dates[match(det_his_forordering$deployment_id, dates$deployment_id), ]
+dates
+dates <- dates[-c(1, 2)]
+
+d <- as.numeric(unlist(dates))
+d_s <- scale(d, center = TRUE, scale = TRUE)
+dates_s <- matrix(d_s, nrow = nrow(dates), ncol = ncol(dates))
+dates_s <- as.data.frame(dates_s)
+```
+
+```{r environmental-covariates}
+envi <- read.csv(file.path(data_dir, "plot_level_means_fuentes_inputs.csv"))
+envi <- envi %>% dplyr::select(plot, topo_prod_mean_1ha, aet_mean_1ha, cwd_mean_1ha, elevation_mean_1ha)
+envi <- envi[match(det_his_forordering$plot_id, envi$plot), ]
+setdiff(envi$plot, det_his_forordering$plot_id)
+envi$plot <- as.factor(envi$plot)
+
+envi <- envi[match(det_his_forordering$plot_id, envi$plot), ]
+```
+
+```{r combine-and-scale}
+site_cov_s <- merge(struc, envi, by.x="X.1", by.y="plot", all.x=T, all.y=T)
+
+site_cov_s <- site_cov_s[match(det_his_forordering$plot_id, site_cov_s$X.1), ]
+setdiff(site_cov_s$X.1, det_his_forordering$plot_id)
+site_cov_s_backup <- site_cov_s
+colnames(site_cov_s)
+
+site_cov_s <- site_cov_s[-c(1)]
+
+numeric_cols <- sapply(site_cov_s, is.numeric)
+site_cov_s[numeric_cols] <- scale(site_cov_s[numeric_cols])
+
+colnames(site_cov_s)
+```
+
+```{r species-and-predictors}
+metrics <- c(
+  "lg_snag_ha",
+  "dens_lg",
+  "dens_md",
+  "cwd_m3_",
+  "fuel_kgha",
+  "gr.mean.percent.shrub",
+  "gr.mean.percent.herbGrass",
+  "mean_cc_90",
+  "vert_div",
+  "tree_rich",
+  "herb_rich",
+  "shrub_rich",
+  "Snag_Density_Diameter_Med_per_Hectare",
+  "Densiometer_CV",
+  "Tree.Density.Diameter.Class.Saplings.Hectare",
+  "Tree.Density.Diameter.Class.Small.Hectare",
+  "topo_prod_mean_1ha",
+  "aet_mean_1ha",
+  "cwd_mean_1ha",
+  "y_ca_alb")
+
+species_info <- list(
+  American_Black_Bear = list(cols = metrics, clean = "American Black Bear"),
+  Mule_Deer = list(cols = metrics, clean = "Mule Deer"),
+  Coyote = list(cols = metrics, clean = "Coyote"),
+  Golden_Mantled_Ground_Squirrel = list(cols = metrics, clean = "Golden Mantled Ground Squirrel"),
+  `Douglas's_Squirrel` = list(cols = metrics, clean = "Douglas's Squirrel"),
+  Western_Gray_Squirrel = list(cols = metrics, clean = "Western Gray Squirrel"),
+  Grey_Fox = list(cols = metrics, clean = "Grey Fox"),
+  Striped_Skunk = list(cols = metrics, clean = "Striped Skunk"),
+  California_Ground_Squirrel = list(cols = metrics, clean = "California Ground Squirrel")
+)
+```
+
+The model uses daily detections. All detection tables and the site-ordering table are in `detection data/`. The original excluded deployment is retained.
+
+```{r detection-array}
+det_matrices <- list()
+
+for (sp in names(species_info)) {
+
+  species <- sp
+  sp_columns <- species_info[[sp]]$cols
+  species_clean <- species_info[[sp]]$clean
+
+  det_his <- read.csv(file.path(detection_dir, paste0("y_", species, ".csv"))) %>%
+    dplyr::filter(deployment_id != "P428_FISHER12_35_2024_TRY2")
+
+  det_his <- det_his[match(det_his_forordering$deployment_id, det_his$deployment_id), ]
+
+  det_his_nodep <- det_his %>%
+    dplyr::select(-deployment_id, -X)
+
+  det_matrices[[sp]] <- as.matrix(det_his_nodep)
+}
+
+n_species <- length(det_matrices)
+n_sites   <- nrow(det_matrices[[1]])
+n_visits  <- ncol(det_matrices[[1]])
+
+y_array <- array(
+  data     = unlist(det_matrices),
+  dim      = c(n_sites, n_visits, n_species),
+  dimnames = list(
+    site    = det_his_forordering$deployment_id,
+    visit   = colnames(det_matrices[[1]]),
+    species = names(det_matrices)
+  )
+)
+
+y_array <- aperm(y_array, perm = c(3, 1, 2))
+
+dim(y_array)
+
+y_comm <- aperm(y_array, c(2, 3, 1))
+dim(y_comm)
+
+umf_comm <- unmarkedFrameOccuComm(
+  y        = y_comm,
+  siteCovs = site_cov_s,
+  obsCovs  = list(dates = dates_s)
+)
+```
+
+These checks stop obvious row/column mismatches. The missing-date audit documents the existing discrepancy without filling dates or changing detections.
+
+```{r input-checks}
+stopifnot(nrow(site_cov_s) == nrow(det_his_forordering),
+          !anyNA(site_cov_s),
+          nrow(dates_s) == nrow(det_his_forordering))
+for (sp in names(det_matrices)) {
+  stopifnot(identical(dim(det_matrices[[sp]]), dim(as.matrix(dates))),
+            identical(colnames(det_matrices[[sp]]), colnames(dates)))
+}
+
+missing_dates <- data.frame()
+for (sp in names(det_matrices)) {
+  missing <- which(!is.na(det_matrices[[sp]]) & is.na(as.matrix(dates)), arr.ind = TRUE)
+  missing_dates <- rbind(missing_dates, data.frame(
+    species = rep(sp, nrow(missing)),
+    deployment_id = det_his_forordering$deployment_id[missing[, 1]],
+    visit = colnames(dates)[missing[, 2]],
+    detection = det_matrices[[sp]][missing]))
+}
+write.csv(missing_dates, file.path(tables_dir, "observations_missing_dates.csv"), row.names = FALSE)
+if (nrow(missing_dates) > 0) {
+  warning(nrow(missing_dates), " species/visit observations lack survey dates; see observations_missing_dates.csv. The original inputs and model handling are retained.")
+}
+```
+
+```{r covariate-checks}
+pred_vars <- c(
+  "lg_snag_ha",
+  "dens_lg",
+  "dens_md",
+  "cwd_m3_",
+  "fuel_kgha",
+  "gr.mean.percent.shrub",
+  "gr.mean.percent.herbGrass",
+  "mean_cc_90",
+  "vert_div",
+  "tree_rich",
+  "herb_rich",
+  "shrub_rich",
+  "Snag_Density_Diameter_Med_per_Hectare",
+  "Densiometer_CV",
+  "Tree.Density.Diameter.Class.Saplings.Hectare",
+  "Tree.Density.Diameter.Class.Small.Hectare",
+  "topo_prod_mean_1ha",
+  "aet_mean_1ha",
+  "cwd_mean_1ha",
+  "y_ca_alb",
+  "elevation_mean_1ha"
+)
+cor_matrix <- cor(site_cov_s[, pred_vars], use = "complete.obs")
+high_cor <- which(abs(cor_matrix) > 0.7 & upper.tri(cor_matrix), arr.ind = TRUE)
+data.frame(var1 = rownames(cor_matrix)[high_cor[,1]],
+           var2 = colnames(cor_matrix)[high_cor[,2]],
+           r    = cor_matrix[high_cor])
+checkvif <- site_cov_s[, pred_vars]
+library(usdm)
+usdm::vif(checkvif)
+write.csv(cor_matrix, file.path(tables_dir, "covariate_correlations.csv"))
+write.csv(usdm::vif(checkvif), file.path(tables_dir, "covariate_VIF.csv"), row.names = FALSE)
+```
+
+## 3. Compare the eight candidate community occupancy models
+
+These formulas follow the predictor memberships in manuscript Table S1. Model 6
+is the existing selected model (`m6`); it remains the source of occupancy
+predictions. The comparison reports both AIC and AICc, parameter counts,
+delta values, AICc weights, and fitting diagnostics. Failed fits are retained
+in the table and excluded from ranking.
+
+AICc uses 97 sampling sites as `nobs`, explicitly, and counts both fixed-effect
+and random-effect variance parameters. The correction is
+`AICc = AIC + 2*K*(K+1)/(n_sites-K-1)`. Existing scores near 9287 in the
+manuscript are AIC values; the regenerated AICc column should be used when
+reporting AICc. See the [AICcmodavg documentation](https://search.r-project.org/CRAN/refmans/AICcmodavg/html/AICc.html).
+Review optimizer warnings and the regenerated comparison before updating Table S1.
+The code does not silently select a different model for subsequent analyses.
+
+```{r occupancy-model}
+if (!requireNamespace("AICcmodavg", quietly = TRUE)) {
+  stop("Install AICcmodavg before running the candidate-model comparison.")
+}
+# Eight hypotheses in Table S1, in the manuscript's model-number order.
+# Keep daily Julian date (dates) in detection for every occupancy candidate.
+candidate_formulas <- list(
+  model1 = ~ dates ~ dens_lg + Tree.Density.Diameter.Class.Small.Hectare + mean_cc_90 + gr.mean.percent.shrub + gr.mean.percent.herbGrass + vert_div + aet_mean_1ha,
+  model2 = ~ dates ~ dens_lg + lg_snag_ha + Densiometer_CV + cwd_m3_ + gr.mean.percent.shrub + vert_div + topo_prod_mean_1ha,
+  model3 = ~ dates ~ lg_snag_ha + mean_cc_90 + Densiometer_CV + shrub_rich + herb_rich + vert_div + topo_prod_mean_1ha,
+  model4 = ~ dates ~ dens_lg + lg_snag_ha + mean_cc_90 + tree_rich + cwd_m3_ + vert_div + aet_mean_1ha,
+  model5 = ~ dates ~ dens_md + mean_cc_90 + Densiometer_CV + gr.mean.percent.shrub + gr.mean.percent.herbGrass + vert_div + aet_mean_1ha,
+  model6 = ~ dates ~ dens_lg + lg_snag_ha + mean_cc_90 + gr.mean.percent.shrub + gr.mean.percent.herbGrass + vert_div + aet_mean_1ha,
+  model7 = ~ dates ~ dens_lg + lg_snag_ha + Densiometer_CV + gr.mean.percent.shrub + vert_div + aet_mean_1ha,
+  model8 = ~ dates ~ Tree.Density.Diameter.Class.Small.Hectare + lg_snag_ha + mean_cc_90 + cwd_m3_ + gr.mean.percent.shrub + aet_mean_1ha
+)
+selected_model_id <- "model6"  # Manuscript model 6 in Table S1.
+aicc_n_sites <- unmarked::numSites(umf_comm)
+stopifnot(aicc_n_sites == 97L)
+candidate_model_specs <- data.frame(
+  model = names(candidate_formulas),
+  formula = vapply(candidate_formulas, function(x) paste(deparse(x), collapse = " "), character(1)),
+  stringsAsFactors = FALSE
+)
+write.csv(candidate_model_specs, file.path(tables_dir, "occupancy_candidate_formulas.csv"), row.names = FALSE)
+
+fit_occupancy_candidate <- function(formula, model_id, data, n_sites) {
+  fit_warnings <- character()
+  error_text <- ""
+  fit <- tryCatch(withCallingHandlers(
+    unmarked::occuComm(formula, data = data),
+    warning = function(w) {
+      fit_warnings <<- c(fit_warnings, conditionMessage(w))
+      invokeRestart("muffleWarning")
+    }), error = function(e) { error_text <<- conditionMessage(e); NULL })
+  row <- data.frame(model = model_id, n_sites = n_sites, K = NA_real_,
+                    logLik = NA_real_, AIC = NA_real_, AICc = NA_real_,
+                    optimizer_code = NA_integer_, finite_fixed_effect_SE = FALSE,
+                    eligible = FALSE, status = "fit_failed", warnings = "", error = error_text)
+  if (!is.null(fit)) {
+    row$optimizer_code <- fit@opt$convergence
+    # Do not silently compare fits that used different sampling sites.
+    same_sites <- length(fit@sitesRemoved) == 0L && unmarked::numSites(fit@data) == n_sites
+    row$logLik <- -fit@negLogLike
+    row$AIC <- fit@AIC
+    # AICcmodavg includes the estimated random-effect variance parameters in K.
+    # length(coef(fit)) alone would undercount parameters for occuComm.
+    ic <- tryCatch(list(K = AICcmodavg::AICc(fit, return.K = TRUE),
+                        AICc = AICcmodavg::AICc(fit, nobs = n_sites)),
+                   error = function(e) { row$error <<- conditionMessage(e); NULL })
+    if (!is.null(ic)) {
+      row$K <- ic$K
+      if (n_sites > row$K + 1) row$AICc <- ic$AICc
+      stopifnot(isTRUE(all.equal(row$AIC, -2 * row$logLik + 2 * row$K, tolerance = 1e-7)))
+    }
+    fixed_var <- tryCatch(suppressWarnings(diag(vcov(fit))), error = function(e) NA_real_)
+    row$finite_fixed_effect_SE <- length(fixed_var) > 0L && all(is.finite(fixed_var) & fixed_var >= 0)
+    row$eligible <- same_sites && identical(as.integer(row$optimizer_code), 0L) &&
+      is.finite(row$AICc) && row$finite_fixed_effect_SE
+    row$status <- if (!same_sites) "different_sites" else if (row$optimizer_code != 0L) {
+      "optimizer_failed"
+    } else if (!row$finite_fixed_effect_SE) "nonfinite_standard_errors" else if (!is.finite(row$AICc)) {
+      "AICc_unavailable"
+    } else "converged"
+  }
+  row$warnings <- paste(unique(fit_warnings), collapse = " | ")
+  list(fit = fit, statistics = row)
+}
+
+# All candidates are refitted from the same input frame; failed fits remain in
+# the exported table, but receive no delta, weight, or rank.
+candidate_fits <- vector("list", length(candidate_formulas))
+names(candidate_fits) <- names(candidate_formulas)
+for (id in names(candidate_formulas)) {
+  message("Fitting Table S1 ", id)
+  candidate_fits[[id]] <- fit_occupancy_candidate(candidate_formulas[[id]], id, umf_comm, aicc_n_sites)
+  # Save progress after each model in case a later fit is interrupted.
+  saveRDS(candidate_fits, file.path(results_dir, "occupancy_candidate_fits.rds"))
+}
+model_comparison <- do.call(rbind, lapply(candidate_fits, `[[`, "statistics"))
+rownames(model_comparison) <- NULL
+model_comparison$formula <- candidate_model_specs$formula[match(model_comparison$model, candidate_model_specs$model)]
+model_comparison$delta_AIC <- model_comparison$delta_AICc <- NA_real_
+model_comparison$AICc_weight <- NA_real_
+model_comparison$AICc_rank <- NA_integer_
+ok <- model_comparison$eligible
+if (any(ok)) {
+  model_comparison$delta_AIC[ok] <- model_comparison$AIC[ok] - min(model_comparison$AIC[ok])
+  model_comparison$delta_AICc[ok] <- model_comparison$AICc[ok] - min(model_comparison$AICc[ok])
+  weights <- exp(-0.5 * model_comparison$delta_AICc[ok])
+  model_comparison$AICc_weight[ok] <- weights / sum(weights)
+  model_comparison$AICc_rank[ok] <- rank(model_comparison$AICc[ok], ties.method = "min")
+}
+model_comparison$selected_for_manuscript <- model_comparison$model == selected_model_id
+write.csv(model_comparison, file.path(tables_dir, "occupancy_model_comparison_AICc.csv"), row.names = FALSE)
+print(model_comparison[, c("model", "K", "AIC", "AICc", "delta_AICc", "AICc_weight", "status")], row.names = FALSE)
+selected_row <- match(selected_model_id, model_comparison$model)
+if (!model_comparison$eligible[selected_row]) {
+  stop("The manuscript model did not pass fitting checks. Inspect occupancy_model_comparison_AICc.csv before continuing.")
+}
+if (model_comparison$AICc_rank[selected_row] != 1L) {
+  warning("The manuscript model is not the lowest-AICc candidate in this run. Review the comparison; m6 is not switched automatically.")
+}
+m6 <- candidate_fits[[selected_model_id]]$fit
+summary(m6)
+rand_est <- randomTerms(m6)
+rand_est$Estimate <- round(rand_est$Estimate, 4)
+rand_est2 <- randomTerms(m6, addMean = TRUE)
+write.csv(rand_est, file.path(tables_dir, "random_effect_deviations.csv"))
+write.csv(rand_est2, file.path(tables_dir, "species_coefficients.csv"))
+write.csv(model_comparison[selected_row, c("model", "K", "n_sites", "AIC", "AICc")],
+          file.path(tables_dir, "occupancy_AIC.csv"), row.names = FALSE)
+```
+
+```{r occupancy-predictions}
+pred_comm <- unmarked::predict(m6, type = "state", re.form = NULL)
+
+for (sp in names(pred_comm)) {
+  df_out <- data.frame(
+    deployment_id = det_his_forordering$deployment_id,
+    pred_comm[[sp]]
+  )
+  write.csv(df_out,
+            file = file.path(tables_dir, paste0("model predictions/pred_", sp, ".csv")),
+            row.names = FALSE)
+}
+```
+
+Keep your existing per-species tables and object names, including `Douglass_Squirrel` in the combined table.
+
+```{r read-prediction-tables}
+md <- read.csv(file.path(tables_dir, "model predictions/pred_Mule_Deer.csv")) %>%
+  dplyr::select(deployment_id, Predicted) %>%
+  dplyr::rename("Mule_Deer" = "Predicted")
+abb <- read.csv(file.path(tables_dir, "model predictions/pred_American_Black_Bear.csv")) %>%
+  dplyr::select(deployment_id, Predicted) %>%
+  dplyr::rename("American_Black_Bear" = "Predicted")
+cgs <- read.csv(file.path(tables_dir, "model predictions/pred_California_Ground_Squirrel.csv")) %>%
+  dplyr::select(deployment_id, Predicted) %>%
+  dplyr::rename("California_Ground_Squirrel" = "Predicted")
+
+gms <- read.csv(file.path(tables_dir, "model predictions/pred_Golden_Mantled_Ground_Squirrel.csv")) %>%
+  dplyr::select(deployment_id, Predicted) %>%
+  dplyr::rename("Golden_Mantled_Ground_Squirrel" = "Predicted")
+
+ds <- read.csv(file.path(tables_dir, "model predictions/pred_Douglas's_Squirrel.csv")) %>%
+  dplyr::select(deployment_id, Predicted) %>%
+  dplyr::rename("Douglass_Squirrel" = "Predicted")
+
+wgs <- read.csv(file.path(tables_dir, "model predictions/pred_Western_Gray_Squirrel.csv")) %>%
+  dplyr::select(deployment_id, Predicted) %>%
+  dplyr::rename("Western_Gray_Squirrel" = "Predicted")
+
+sk <- read.csv(file.path(tables_dir, "model predictions/pred_Striped_Skunk.csv")) %>%
+  dplyr::select(deployment_id, Predicted) %>%
+  dplyr::rename("Striped_Skunk" = "Predicted")
+
+cy <- read.csv(file.path(tables_dir, "model predictions/pred_Coyote.csv")) %>%
+  dplyr::select(deployment_id, Predicted) %>%
+  dplyr::rename("Coyote" = "Predicted")
+
+gf <- read.csv(file.path(tables_dir, "model predictions/pred_Grey_Fox.csv")) %>%
+  dplyr::select(deployment_id, Predicted) %>%
+  dplyr::rename("Grey_Fox" = "Predicted")
+```
+
+```{r fire-data}
+fire <- read.csv(file.path(data_dir, "plot_fire_metrics_suppl_4_061126.csv"))
+f_class <- read.csv(file.path(data_dir, "plot_fire_metrics_1_rev_05082026.csv")) %>%
+  dplyr::select(plot, severity_class_ha_rev)
+fire <- merge(fire, f_class, by = "plot", all.x = TRUE)
+fire <- fire[match(det_his_forordering$plot_id, fire$plot), ]
+stopifnot(!anyNA(fire$plot), !anyNA(fire$severity_class_ha_rev))
+site_cov <- cbind(site_cov_s, fire)
+```
+
+```{r combine-predictions}
+stopifnot(all(vapply(list(md, abb, cgs, gms, ds, wgs, sk, cy, gf),
+  function(x) identical(x$deployment_id, md$deployment_id), logical(1))))
+abb <- abb[, -1, drop = FALSE]
+cgs <- cgs[, -1, drop = FALSE]
+gms <- gms[, -1, drop = FALSE]
+ds  <- ds[,  -1, drop = FALSE]
+wgs <- wgs[, -1, drop = FALSE]
+sk  <- sk[,  -1, drop = FALSE]
+cy  <- cy[,  -1, drop = FALSE]
+gf  <- gf[,  -1, drop = FALSE]
+
+df <- cbind(md, abb, cgs, gms, ds, wgs, sk, cy, gf, site_cov)
+write.csv(df, file.path(tables_dir, "occu_pred_all_sp.csv"))
+```
+
+## 4. NMDS, environmental fitting, and community comparisons
+
+```{r nmds}
+set.seed(123)
+nmds3 <- metaMDS(df[,2:10], distance = "bray", k = 2, try = 300, trymax = 900)
+
+print(nmds3)
+nmds3_site <- as.data.frame(scores(nmds3)$sites)
+nmds3_site <- cbind(df$deployment_id, nmds3_site)
+write.csv(nmds3_site, file.path(tables_dir, "nmds2k_SiteScores.csv"))
+
+nmds_SpeciesScores3 <- as.data.frame(scores(nmds3, "species"))
+nmds_SpeciesScores3$species <- rownames(nmds_SpeciesScores3)
+nmds_SpeciesScores3$species <- gsub("_", " ", nmds_SpeciesScores3$species)
+nmds_SpeciesScores3
+write.csv(nmds_SpeciesScores3, file.path(tables_dir, "nmds2k_SpeciesScores.csv"))
+fireClass <- df %>% dplyr::select(deployment_id, severity_class_ha_rev)
+nmds3_site <- cbind(nmds3_site, fireClass)
+```
+
+Envfit models stay in the analysis file; their arrows and labels are prepared in the figures file.
+
+```{r nmds-covariates}
+cols <- c("lg_snag_ha",
+  "dens_lg",
+  "dens_md",
+  "cwd_m3_",
+  "fuel_kgha",
+  "gr.mean.percent.shrub",
+  "gr.mean.percent.herbGrass",
+  "vert_div",
+  "tree_rich",
+  "herb_rich",
+  "shrub_rich",
+  "Snag_Density_Diameter_Med_per_Hectare",
+  "Densiometer_CV",
+  "Tree.Density.Diameter.Class.Saplings.Hectare",
+  "Tree.Density.Diameter.Class.Small.Hectare",
+  "topo_prod_mean_1ha",
+  "cwd_mean_1ha", "y_ca_alb", "mean_cc_90", "aet_mean_1ha")
+
+env <- df[,which(names(df) %in% cols)]
+
+env <- data.frame(scale(env, center = TRUE, scale = TRUE))
+
+en3 = envfit(nmds3, env, permutations = 999, na.rm = TRUE)
+en3_out <- data.frame(
+  scores(en3, "vectors"),
+  r2    = en3$vectors$r,
+  pval  = en3$vectors$pvals
+)
+write.csv(en3_out, file.path(tables_dir, "en3_envfit.csv"))
+```
+
+```{r nmds-functional-groups}
+df <- df %>%
+  dplyr::mutate(
+    omni_carn = rowSums(dplyr::across(c(
+      American_Black_Bear,
+      Coyote,
+      Grey_Fox,
+      Striped_Skunk
+    )), na.rm = TRUE),
+    ground_gran = rowSums(dplyr::across(c(
+      Mule_Deer,
+      California_Ground_Squirrel,
+      Golden_Mantled_Ground_Squirrel
+    )), na.rm = TRUE),
+    canopy_gran = rowSums(dplyr::across(c(
+      Western_Gray_Squirrel,
+      Douglass_Squirrel
+    )), na.rm = TRUE)
+  )
+
+func <- df %>% dplyr::select(omni_carn, ground_gran, canopy_gran)
+
+func <- data.frame(scale(func, center = TRUE, scale = TRUE))
+
+en3_fu <- envfit(nmds3, func, permutations = 999, na.rm = TRUE)
+```
+
+```{r nmds-environment}
+envdf <- envi
+envdf <- envdf %>%
+  dplyr::select(-plot)
+envdf <- data.frame(scale(envdf, center = TRUE, scale = TRUE))
+
+en3.2 <- envfit(nmds3, envdf, permutations = 999, na.rm = TRUE)
+```
+
+```{r permanova-and-dispersion}
+com <- df[,2:10]
+
+perm_dist <- vegdist(com, method = "bray")
+
+dispersion <- vegan::betadisper(perm_dist, group = df$severity_class_ha_rev, type = "centroid")
+print(dispersion)
+
+anova(dispersion)
+permutest_out <- vegan::permutest(dispersion)
+print(permutest_out)
+write.csv(as.data.frame(permutest_out$tab), file.path(tables_dir, "betadisper_permutest.csv"))
+
+perm_test <- adonis2(
+  com ~ df$severity_class_ha_rev,
+  method = "bray",
+  permutations = 999)
+print(perm_test)
+write.csv(as.data.frame(perm_test), file.path(tables_dir, "permanova_adonis2.csv"), row.names = TRUE)
+```
+
+```{r pairwise-permanova}
+results <- pairwise.adonis(com, df$severity_class_ha_rev, p.adjust.m = "holm")
+print(results)
+
+write.csv(results, file.path(tables_dir, "pairwise.adonis.csv"))
+```
+
+The functional-group lookup uses `Douglas's_Squirrel`; your combined community table uses `Douglass_Squirrel`. Match those spellings for the SIMPER join.
+
+```{r simper}
+func_gr <- read.csv(file.path(data_dir, "Mammals_groups.csv")) %>% dplyr::select(Species, new_func)
+func_gr$Species[func_gr$Species == "Douglas's_Squirrel"] <- "Douglass_Squirrel"
+
+simper_results <- simper(com, group = fireClass$severity_class_ha_rev)
+packageVersion("vegan")
+citation("vegan")
+sim_cmd <- data.frame(summary(simper_results, ordered = TRUE)[["control_modplus"]]) %>%
+  tibble::rownames_to_column("Species") %>%
+  merge(func_gr, by = "Species", all.x = TRUE)
+write.csv(sim_cmd, file.path(tables_dir, "Mammals_simper_control_modplus.csv"))
+
+sim_cmd2 <- data.frame(summary(simper_results, ordered = TRUE)[["control_lowlow"]]) %>%
+  tibble::rownames_to_column("Species") %>%
+  merge(func_gr, by = "Species", all.x = TRUE)
+write.csv(sim_cmd2, file.path(tables_dir, "Mammals_simper_control_lowlow.csv"))
+
+sim_cmd3 <- data.frame(summary(simper_results, ordered = TRUE)[["control_mod"]]) %>%
+  tibble::rownames_to_column("Species") %>%
+  merge(func_gr, by = "Species", all.x = TRUE)
+write.csv(sim_cmd3, file.path(tables_dir, "Mammals_simper_control_mod.csv"))
+
+sim_cmd4 <- data.frame(summary(simper_results, ordered = TRUE)[["low_modplus"]]) %>%
+  tibble::rownames_to_column("Species") %>%
+  merge(func_gr, by = "Species", all.x = TRUE)
+write.csv(sim_cmd4, file.path(tables_dir, "Mammals_simper_low_modplus.csv"))
+```
+
+## 5. All-predictor RDA
+
+```{r rda-fire-predictors}
+fire_df <- read.csv(file.path(data_dir, "Corrected_Fire_Metrics_6-11-26.csv")) %>%
+  dplyr::select("X", "fire_1_num", "fire_2_num", "fire_3_num", "max_sev_all", "max_sev_recent2", "max_sev_since_2000", "max_sev_since_2010", "max_sev_since_2015", "max_sev_since_2020", "mod_n", "fire_n_1984_2024", "burn_prop_1950_1983", "burn_prop_1900_1949", "tslf_composite")
+fire_df$tslf_composite_c <- cut(fire_df$tslf_composite,
+                   breaks = c(0, 3, 38, Inf),
+                   labels = c("0-3", "3-38", "38+"),
+                   include.lowest = TRUE,
+                   right = TRUE)
+fire_df$tslf_composite_c <- factor(fire_df$tslf_composite_c,
+                      levels = c("0-3", "3-38", "38+"))
+
+factor_cols <- c("fire_1_num", "fire_2_num", "fire_3_num", "max_sev_all", "max_sev_recent2", "max_sev_since_2000", "max_sev_since_2010", "max_sev_since_2015", "max_sev_since_2020", "X", "tslf_composite_c")
+
+fire_df <- fire_df %>%
+  dplyr::mutate(dplyr::across(dplyr::all_of(factor_cols), as.factor))
+
+fire_df <- fire_df[match(det_his_forordering$plot_id, fire_df$X), ]
+
+skew_values_f <- sapply(fire_df[, sapply(fire_df, is.numeric)],
+                      skewness, na.rm = TRUE)
+print(skew_values_f)
+hist(fire_df$burn_prop_1950_1983)
+hist(fire_df$burn_prop_1900_1949)
+fire_df$burn_prop_1950_1983 <- log1p(fire_df$burn_prop_1950_1983)
+fire_df$burn_prop_1900_1949 <- log1p(fire_df$burn_prop_1900_1949)
+
+fire_sc <- fire_df %>%
+  dplyr::select(-X) %>%
+  dplyr::mutate(dplyr::across(dplyr::where(is.numeric), scale))
+colnames(fire_sc)
+fire_sc <- fire_sc %>% dplyr::select(-c("tslf_composite"))
+```
+
+This is your all-predictor starting set, followed by the existing automated
+VIF procedure and forward selection. As in the original `metrics` vector,
+elevation is not a candidate and `y_ca_alb` is removed. The alternative manual
+VIF branch intended to retain TSLF is not run.
+
+```{r rda-candidate-set}
+df_all2 <- df %>% dplyr::select(dplyr::all_of(metrics)) %>% dplyr::select(-y_ca_alb)
+fire_sc2 <- fire_sc
+df_all2 <- cbind(df_all2, fire_sc2)
+
+Y_hell <- decostand(df[, 2:10], "hellinger")
+
+preds_iter <- df_all2
+colnames(preds_iter)
+colnames(df_all2)
+```
+
+The `.drop_aliased()` helper below was already present in your original R Markdown.
+
+```{r rda-vif-filtering}
+set.seed(123)
+.drop_aliased <- function(preds_df) {
+  dummy_y <- rnorm(nrow(preds_df))
+  na_coefs <- names(which(is.na(coef(suppressWarnings(lm(dummy_y ~ ., data = preds_df))))))
+  if (length(na_coefs) == 0) return(list(data = preds_df, removed = character(0)))
+  col_names <- names(preds_df)
+  removed <- unique(unlist(lapply(na_coefs, function(cn) {
+    m <- col_names[startsWith(cn, col_names)]
+    if (length(m) > 0) m[which.max(nchar(m))] else character(0)
+  })))
+  if (length(removed) > 0)
+    preds_df <- preds_df[, !col_names %in% removed, drop = FALSE]
+  list(data = preds_df, removed = removed)
+}
+
+repeat {
+  r <- .drop_aliased(preds_iter)
+  if (length(r$removed) == 0) break
+  cat("Removed aliased:", paste(r$removed, collapse = ", "), "\n")
+  preds_iter <- r$data
+}
+cat("Starting VIF loop with", ncol(preds_iter), "predictors\n")
+
+iter_count <- 0
+seen_states <- character(0)
+repeat {
+  iter_count <- iter_count + 1
+  state <- paste(sort(names(preds_iter)), collapse = "|")
+  if (state %in% seen_states) {
+    stop("VIF filtering repeated the same predictor set. Check the predictor table before continuing.")
+  }
+  seen_states <- c(seen_states, state)
+
+  rda_iter <- rda(Y_hell ~ ., data = preds_iter)
+  vif_iter <- vif.cca(rda_iter)
+
+  if (any(is.na(vif_iter))) {
+    r <- .drop_aliased(preds_iter)
+    if (length(r$removed) > 0) {
+      fire_count_vars <- c("fire_1_num", "fire_2_num", "fire_3_num")
+      if (any(r$removed %in% fire_count_vars))
+        r$removed <- union(r$removed, intersect(fire_count_vars, names(preds_iter)))
+      cat("Removing newly aliased:", paste(r$removed, collapse = ", "), "\n")
+      preds_iter <- preds_iter[, !names(preds_iter) %in% r$removed, drop = FALSE]
+    }
+    if (length(r$removed) == 0) stop("Unresolved aliased predictors in VIF filtering.")
+    next
+  }
+
+  cat("Iteration", iter_count, "| predictors:", ncol(preds_iter), "| max VIF:", round(max(vif_iter), 2), "\n")
+  if (max(vif_iter) <= 5) break
+
+  drop_dummy <- names(which.max(vif_iter))
+  col_names <- names(preds_iter)
+  dummy_matches <- col_names[startsWith(drop_dummy, col_names)]
+  drop_var <- if (length(dummy_matches) > 0) dummy_matches[which.max(nchar(dummy_matches))] else drop_dummy
+  fire_count_vars <- c("fire_1_num", "fire_2_num", "fire_3_num")
+  if (drop_var %in% fire_count_vars) {
+    drop_var <- intersect(fire_count_vars, col_names)
+    cat("  Dropping fire count group:", paste(drop_var, collapse = ", "), "(VIF =", round(vif_iter[drop_dummy], 2), ")\n")
+  } else {
+    cat("  Dropping:", drop_var, "(VIF =", round(vif_iter[drop_dummy], 2), ")\n")
+  }
+  preds_iter <- preds_iter[, !col_names %in% drop_var, drop = FALSE]
+}
+cat("Final predictors (iterative):", paste(colnames(preds_iter), collapse = ", "), "\n")
+colnames(preds_iter)
+df_all3 <- preds_iter
+
+colnames(df_all3)
+write.csv(data.frame(variable = colnames(df_all3)),
+          file = file.path(tables_dir, "selected_vars_allvars_afterVIF.csv"), row.names = FALSE)
+```
+
+Each permutation test is calculated once and saved. Explicit seeds make this cleaned run repeatable; compare permutation results with your manuscript before release.
+
+```{r rda-forward-selection}
+placeholder <- ""
+
+colnames(df_all3)
+
+model_null <- rda(Y_hell ~ 1, data = df_all3)
+
+model_full <- rda(Y_hell ~ .,  data = df_all3)
+vif_iter2 <- vif.cca(model_full)
+
+set.seed(123)
+forward_selection <- ordiR2step(
+  object = model_null,
+  scope = formula(model_full),
+  direction = "forward",
+  permutations = 999
+)
+vars_selected <- attr(terms(forward_selection), "term.labels")
+df_selected <- df_all3[, vars_selected, drop = FALSE]
+colnames(df_selected)
+write.csv(data.frame(variable = vars_selected),
+          file = file.path(tables_dir, paste0("selected_vars_allvars_afterForwardSel", placeholder, ".csv")), row.names = FALSE)
+rda_mod2 <- rda(Y_hell ~ ., data = df_selected)
+vif.cca(rda_mod2)
+r2 <- RsquareAdj(rda_mod2)
+r2
+
+set.seed(123)
+anova_mod2_global <- anova(rda_mod2, permutations = 999)
+print(anova_mod2_global)
+write.csv(as.data.frame(anova_mod2_global), file.path(tables_dir, paste0("anova_global_VIFRDA", placeholder, ".csv")), row.names = TRUE)
+anova_res <- anova(rda_mod2, by = "margin", permutations = 999)
+anova_df <- as.data.frame(anova_res)
+write.csv(anova_df, file.path(tables_dir, paste0("anova_results_VIFRDA", placeholder, ".csv")), row.names = TRUE)
+anova_res2 <- anova(rda_mod2, by = "term", permutations = 999)
+anova_df2 <- as.data.frame(anova_res2)
+write.csv(anova_df2, file.path(tables_dir, paste0("anovabyterm_results_VIFRDA", placeholder, ".csv")), row.names = TRUE)
+```
+
+Preserve your optional post-hoc canopy envfit. It is not an additional RDA constraint.
+
+```{r rda-canopy-overlay}
+canopy_df <- data.frame(mean_cc_90 = df$mean_cc_90)
+canopy_envfit <- envfit(rda_mod2, canopy_df, permutations = 999, na.rm = TRUE)
+print(canopy_envfit)
+```
+
+### Expected richness within three RDA1 site groups
+
+Use the final manuscript RDA site scores with the same scaling and orientation
+as Figure 4. Sites are divided at -0.1 and +0.1, including both boundaries in
+the middle group. Sum the four species' occupancy predictions **within each
+site first**, then calculate the mean, sample variance, and SD of those sums
+across sites in each group. Do this separately for squirrels and
+omnivore-carnivores. These are descriptive summaries of expected richness;
+SD represents variation among sites, not uncertainty in model predictions.
+
+```{r rda1-richness-summaries}
+rda1_threshold <- 0.1
+rda1_predictions <- df
+rda1_scores <- as.data.frame(vegan::scores(rda_mod2, display = "sites"))
+
+# Preserve the same site-score scaling and axis orientation as the manuscript RDA.
+# Confirm the saved row correspondence before matching predictions by deployment ID.
+stopifnot(
+  nrow(rda1_predictions) == 97L, nrow(rda1_scores) == 97L,
+  !anyNA(rda1_predictions$deployment_id),
+  !anyDuplicated(rda1_predictions$deployment_id),
+  identical(rda1_predictions$deployment_id, fireClass$deployment_id),
+  identical(rownames(rda1_scores), rownames(df_selected))
+)
+rda1_site_scores <- data.frame(
+  deployment_id = fireClass$deployment_id, RDA1 = rda1_scores$RDA1
+)
+rda1_match <- match(rda1_predictions$deployment_id, rda1_site_scores$deployment_id)
+stopifnot(!anyNA(rda1_match), all(is.finite(rda1_site_scores$RDA1)))
+rda1_predictions$RDA1 <- rda1_site_scores$RDA1[rda1_match]
+
+rda1_group_levels <- c("RDA1 < -0.1", "-0.1 <= RDA1 <= 0.1", "RDA1 > 0.1")
+# Both boundary values (-0.1 and +0.1) belong to the middle group.
+rda1_predictions$RDA1_group <- factor(
+  ifelse(rda1_predictions$RDA1 < -rda1_threshold, rda1_group_levels[1],
+         ifelse(rda1_predictions$RDA1 > rda1_threshold, rda1_group_levels[3],
+                rda1_group_levels[2])),
+  levels = rda1_group_levels
+)
+
+rda1_species_sets <- list(
+  squirrel = list(
+    title = "Squirrels", axis_name = "squirrel", colour = "#2F6F73",
+    columns = c("California_Ground_Squirrel", "Golden_Mantled_Ground_Squirrel",
+                "Western_Gray_Squirrel", "Douglass_Squirrel"),
+    species_names = paste("California ground squirrel, golden-mantled ground squirrel,",
+                          "Western gray squirrel, and Douglas squirrel")
+  ),
+  omnivore_carnivore = list(
+    title = "Omnivore-carnivores", axis_name = "omnivore-carnivore", colour = "#008837",
+    columns = c("American_Black_Bear", "Coyote", "Grey_Fox", "Striped_Skunk"),
+    species_names = "American black bear, coyote, gray fox, and striped skunk"
+  )
+)
+
+summarize_rda1_richness <- function(predictions, species_set) {
+  stopifnot(all(species_set$columns %in% names(predictions)))
+  psi <- as.matrix(predictions[, species_set$columns, drop = FALSE])
+  stopifnot(is.numeric(psi), !anyNA(psi), all(is.finite(psi)),
+            all(psi >= 0 & psi <= 1))
+
+  # Sum probabilities at each site FIRST; then summarize those sums across sites.
+  # This is expected richness for the four selected species, not abundance.
+  sites <- predictions[, c("deployment_id", "RDA1", "RDA1_group", species_set$columns)]
+  sites$expected_richness <- rowSums(psi)
+  summary_table <- do.call(rbind, lapply(levels(sites$RDA1_group), function(group) {
+    values <- sites$expected_richness[sites$RDA1_group == group]
+    stopifnot(length(values) >= 2L)
+    data.frame(
+      species_group = species_set$title, RDA1_group = group, n_sites = length(values),
+      mean_expected_richness = mean(values),
+      sample_variance_expected_richness = stats::var(values),
+      standard_deviation = stats::sd(values), minimum = min(values), maximum = max(values)
+    )
+  }))
+  summary_table$RDA1_group <- factor(summary_table$RDA1_group,
+                                    levels = levels(sites$RDA1_group))
+  stopifnot(sum(summary_table$n_sites) == nrow(sites))
+
+  list(sites = sites, summary = summary_table)
+}
+rda1_richness_results <- lapply(rda1_species_sets, function(species_set) {
+  summarize_rda1_richness(rda1_predictions, species_set)
+})
+rda1_richness_summary <- do.call(rbind, lapply(rda1_richness_results, `[[`, "summary"))
+rownames(rda1_richness_summary) <- NULL
+for (key in names(rda1_richness_results)) {
+  prefix <- file.path(tables_dir, paste0(key, "_occupancy_by_RDA1_threshold_0p1"))
+  write.csv(rda1_richness_results[[key]]$sites, paste0(prefix, "_sites.csv"), row.names = FALSE)
+  write.csv(rda1_richness_results[[key]]$summary, paste0(prefix, "_summary.csv"), row.names = FALSE)
+}
+write.csv(rda1_richness_summary,
+          file.path(tables_dir, "mammal_expected_richness_by_RDA1_threshold_0p1_summary.csv"), row.names = FALSE)
+print(rda1_richness_summary, row.names = FALSE, digits = 7)
+```
+
+## 6. Variance partitioning
+
+These are the explicitly chosen predictor groups in your original
+all-predictor branch (`placeholder = ""`). They are kept as written rather
+than automatically redefined from the RDA selection. Export the fraction
+tables, because a complete `varpart` object cannot be written directly as CSV.
+
+```{r variance-partitioning}
+env_ <- df %>% dplyr::select(aet_mean_1ha)
+fire_ <- fire_df %>% dplyr::select(max_sev_since_2015)
+veg_ <- df %>% dplyr::select(lg_snag_ha, dens_lg, Densiometer_CV, cwd_m3_,
+                          gr.mean.percent.herbGrass, gr.mean.percent.shrub, vert_div)
+vp <- varpart(Y_hell, env_, fire_, veg_)
+write.csv(as.data.frame(vp$part$indfract), file.path(tables_dir, "vp_details.csv"))
+
+us <- df %>% dplyr::select(gr.mean.percent.shrub, gr.mean.percent.herbGrass, vert_div, cwd_m3_)
+os <- df %>% dplyr::select(lg_snag_ha, dens_lg, Densiometer_CV)
+vp3 <- varpart(Y_hell, env_, fire_, us, os)
+write.csv(as.data.frame(vp3$part$indfract), file.path(tables_dir, "vp_understory_overstory.csv"))
+```
+
+## 7. Occupancy-uncertainty simulations
+
+Retain your method: 10 independent normal draws for each site/species on the
+logit scale, using its predicted mean and SE, followed by `plogis()`. These are
+not joint parameter draws or occupancy-model refits. The simulated RDA uses
+the main all-predictor RDA's `df_selected`, held fixed across simulations.
+
+```{r simulate-occupancy}
+set.seed(123)
+pred_list <- predict(m6, type = "state", backTransform = FALSE)
+
+n_sims <- 10
+n_sp   <- length(pred_list)
+n_site <- nrow(pred_list[[1]])
+
+psi_sims <- vector("list", n_sims)
+
+for (i in 1:n_sims) {
+
+  mat <- matrix(NA, nrow = n_sp, ncol = n_site)
+
+  for (s in 1:n_sp) {
+    eta <- pred_list[[s]]$Predicted
+    se  <- pred_list[[s]]$SE
+
+    eta_sim <- rnorm(n_site, mean = eta, sd = se)
+    psi_sim <- plogis(eta_sim)
+
+    mat[s, ] <- psi_sim
+  }
+
+  psi_sims[[i]] <- mat
+}
+```
+
+The three NMDS envfit analyses from your simulation block are retained and saved for plotting.
+
+```{r simulated-nmds}
+sp_names_sim <- names(pred_list)
+nmds_sims <- vector("list", n_sims)
+for (i in seq_len(n_sims)) {
+  cat("-- Simulation", i, "--\n")
+
+  sim_mat <- t(psi_sims[[i]])
+  colnames(sim_mat) <- sp_names_sim
+  rownames(sim_mat) <- det_his_forordering$deployment_id
+
+  set.seed(123 + i)
+  nmds_i <- metaMDS(sim_mat, distance = "bray", k = 2, try = 50, trymax = 200)
+  cat("   Stress:", round(nmds_i$stress, 4), "\n")
+
+  site_scores_i    <- as.data.frame(scores(nmds_i, "sites"))
+  species_scores_i <- as.data.frame(scores(nmds_i, "species"))
+  species_scores_i$species <- rownames(species_scores_i)
+  species_scores_i$species <- gsub("_", " ", species_scores_i$species)
+
+  site_scores_i <- cbind(fireClass, site_scores_i)
+
+  hull_i <- site_scores_i %>%
+    dplyr::group_by(severity_class_ha_rev) %>%
+    dplyr::slice(chull(NMDS1, NMDS2))
+
+  sim_df <- as.data.frame(sim_mat)
+  func_i <- data.frame(
+    omni_carn   = rowSums(sim_df[, c("American_Black_Bear", "Coyote", "Grey_Fox", "Striped_Skunk")], na.rm = TRUE),
+    ground_gran = rowSums(sim_df[, c("Mule_Deer", "California_Ground_Squirrel", "Golden_Mantled_Ground_Squirrel")], na.rm = TRUE),
+    canopy_gran = rowSums(sim_df[, c("Western_Gray_Squirrel", "Douglas's_Squirrel")], na.rm = TRUE)
+  )
+  func_i <- data.frame(scale(func_i, center = TRUE, scale = TRUE))
+
+  en_i     <- envfit(nmds_i, env,    permutations = 999, na.rm = TRUE)
+  en_fu_i     <- envfit(nmds_i, func_i, permutations = 999, na.rm = TRUE)
+  en_ev_i     <- envfit(nmds_i, envdf, permutations = 999, na.rm = TRUE)
+  nmds_sims[[i]] <- list(
+    nmds        = nmds_i,
+    site_scores = site_scores_i,
+    sp_scores   = species_scores_i,
+    hull        = hull_i,
+    envfit_cov  = en_i,
+    envfit_func = en_fu_i,
+    envfit_env  = en_ev_i,
+    stress      = nmds_i$stress
+  )
+}
+stresses <- vapply(nmds_sims, `[[`, numeric(1), "stress")
+cat("\nStress across 10 simulations:\n")
+print(round(stresses, 4))
+cat("Mean:", round(mean(stresses), 4), "  Range:", paste(round(range(stresses), 4), collapse = " - "), "\n")
+write.csv(data.frame(simulation = seq_len(n_sims), stress = stresses),
+          file.path(tables_dir, "simulations/NMDS_stress.csv"), row.names = FALSE)
+```
+
+```{r simulated-rda}
+rda_values <- data.frame(
+  simulation = integer(),
+  r_squared = numeric(),
+  adj_r_squared = numeric(),
+  RDA1percent = numeric(),
+  RDA2percent = numeric(),
+  stringsAsFactors = FALSE
+)
+
+rda_sims <- vector("list", n_sims)
+for (i in seq_len(n_sims)) {
+
+  cat("-- Simulation", i, "--\n")
+
+  sim_mat <- t(psi_sims[[i]])
+  colnames(sim_mat) <- sp_names_sim
+  rownames(sim_mat) <- det_his_forordering$deployment_id
+  Y_sim <- decostand(sim_mat, "hellinger")
+
+  preds_i <- df_selected
+
+  rda_i <- rda(Y_sim ~ ., data = preds_i)
+  rda_i
+  r2_i <- RsquareAdj(rda_i)
+  cat("   Adj. R²:", round(r2_i$adj.r.squared, 3), "\n")
+
+  site_sc_i <- as.data.frame(scores(rda_i, display = "sites"))
+  sp_sc_i   <- as.data.frame(scores(rda_i, display = "species"))
+  env_sc_i  <- as.data.frame(scores(rda_i, display = "bp"))
+  site_sc_i  <- cbind(fireClass, site_sc_i)
+  hull_rda_i <- site_sc_i %>%
+    dplyr::group_by(severity_class_ha_rev) %>%
+    dplyr::slice(chull(RDA1, RDA2))
+
+  eig_c_i <- rda_i$CCA$eig
+  tot_i_i <- rda_i$tot.chi
+  pct1_i  <- round(100 * eig_c_i[1] / tot_i_i, 1)
+  pct2_i  <- round(100 * eig_c_i[2] / tot_i_i, 1)
+  ax1_i   <- paste0("RDA1 (", pct1_i, "% of total inertia)")
+  ax2_i   <- paste0("RDA2 (", pct2_i, "% of total inertia)")
+
+  sim_title <- paste0("Sim ", i, "  (Adj. R² = ", round(r2_i$adj.r.squared, 3), ")")
+
+  sim_row <- data.frame(
+    simulation = i,
+    r_squared = r2_i$r.squared,
+    adj_r_squared = r2_i$adj.r.squared,
+    RDA1percent = pct1_i,
+    RDA2percent = pct2_i
+  )
+
+  rda_values <- rbind(rda_values, sim_row)
+  rda_sims[[i]] <- list(
+    rda         = rda_i,
+    predictors  = colnames(preds_i),
+    site_scores = site_sc_i,
+    sp_scores   = sp_sc_i,
+    env_scores  = env_sc_i,
+    r2          = r2_i
+  )
+}
+
+r2_vals <- vapply(rda_sims, function(x) x$r2$adj.r.squared, numeric(1))
+cat("\nAdj. R² across 10 simulations:\n")
+print(round(r2_vals, 4))
+cat("Mean:", round(mean(r2_vals), 4), "  Range:", paste(round(range(r2_vals), 4), collapse = " - "), "\n")
+```
+
+Your summary columns are retained. `Mean_Pvalue` is a descriptive mean across simulations, not a combined hypothesis test.
+
+```{r simulation-rda-summary}
+anova_long <- lapply(seq_len(n_sims), function(i) {
+  set.seed(123 + i)
+  a <- as.data.frame(anova(rda_sims[[i]]$rda, by = "margin", permutations = 999))
+  a$Variable <- rownames(a)
+  a$Simulation <- i
+  a[a$Variable != "Residual", ]
+})
+anova_long <- do.call(rbind, anova_long)
+
+names(anova_long)[names(anova_long) == "Pr(>F)"] <- "Pvalue"
+
+vars <- unique(anova_long$Variable)
+wide <- do.call(cbind, lapply(seq_len(n_sims), function(i) {
+  sub <- anova_long[anova_long$Simulation == i, c("Variable", "Variance", "Pvalue")]
+  rownames(sub) <- sub$Variable
+  sub <- sub[vars, c("Variance", "Pvalue")]
+  colnames(sub) <- paste0(c("Variance_Sim", "Pvalue_Sim"), i)
+  sub
+}))
+wide$Variable        <- vars
+wide$Mean_Variance   <- rowMeans(wide[, grep("Variance_Sim", colnames(wide))])
+wide$Mean_Pvalue     <- rowMeans(wide[, grep("Pvalue_Sim",   colnames(wide))])
+wide <- wide[, c("Variable", grep("Sim", colnames(wide), value = TRUE),
+                 "Mean_Variance", "Mean_Pvalue")]
+
+print(round(wide[, -1], 4))
+write.csv(wide, file.path(tables_dir, "simulations/anova_margin_sims2.csv"), row.names = FALSE)
+
+rda_values$mean_ajr <- mean(rda_values$adj_r_squared, na.rm = TRUE)
+rda_values$SD_ajr <- sd(rda_values$adj_r_squared, na.rm = TRUE)
+rda_values$CV_ajr <- rda_values$SD_ajr / rda_values$mean_ajr
+write.csv(rda_values, file.path(tables_dir, "simulations/rda_values_sims2.csv"), row.names = FALSE)
+```
+
+Keep vegan's own fraction labels. This avoids guessing which shared fraction corresponds to each row, an ambiguity noted in the original code.
+
+```{r simulated-variance-partitioning}
+env_vp <- df %>% dplyr::select(aet_mean_1ha)
+fire_vp <- fire_df %>% dplyr::select(max_sev_since_2015)
+veg_vp <- df %>% dplyr::select(lg_snag_ha, dens_lg, Densiometer_CV, cwd_m3_,
+                            gr.mean.percent.herbGrass, gr.mean.percent.shrub, vert_div)
+vp_sims <- vector("list", n_sims)
+vp_df <- data.frame()
+for (i in seq_len(n_sims)) {
+  sim_mat_i <- t(psi_sims[[i]])
+  colnames(sim_mat_i) <- sp_names_sim
+  Y_sim_i <- decostand(sim_mat_i, "hellinger")
+  vp_i <- varpart(Y_sim_i, env_vp, fire_vp, veg_vp)
+  vp_sims[[i]] <- vp_i
+  fractions <- as.data.frame(vp_i$part$indfract)
+  fractions$fraction <- rownames(fractions)
+  fractions$simulation <- i
+  vp_df <- rbind(vp_df, fractions)
+}
+write.csv(vp_df, file.path(tables_dir, "simulations/varpart_sim_fractions.csv"), row.names = FALSE)
+```
+
+## 8. Study summaries
+
+```{r zones-and-elevation}
+ncs_fc <- fire %>% dplyr::select(plot, severity_class_ha_rev)
+
+ncs <- read.csv(file.path(data_dir, "plot_info_2025.csv")) %>% dplyr::select(Plot., Zone)
+
+ncs_fc <- merge(ncs_fc, ncs, by.x= "plot", by.y = "Plot.")
+write.csv(ncs_fc, file.path(tables_dir, "NCS_fireclass.csv"))
+
+ncs_fc_counts <- ncs_fc %>%
+  dplyr::count(severity_class_ha_rev, Zone) %>%
+  tidyr::pivot_wider(names_from = Zone, values_from = n, values_fill = 0)
+elev <- read.csv(file.path(data_dir, "plot_info_with_topographic_data.csv")) %>% dplyr::select(Plot., Zone, elevation)
+el97 <- merge(ncs_fc, elev, by.x="plot", by.y="Plot.")
+
+el97$elev_class <- cut(
+  el97$elevation,
+  breaks = quantile(el97$elevation, probs = seq(0, 1, by = 1/3), na.rm = TRUE),
+  include.lowest = TRUE,
+  labels = c("Low", "Mid", "High")
+)
+mer1 <- merge(f_class, elev, by.x= "plot", by.y = "Plot.")
+write.csv(mer1, file.path(tables_dir, "ncs_elev_allsites.csv"))
+```
+
+```{r deployment-lengths}
+obs <- read.csv(file.path(detection_dir, "y_Coyote.csv")) %>%
+    dplyr::filter(deployment_id != "P428_FISHER12_35_2024_TRY2")
+obs$length <- rowSums(!is.na(obs[, 3:ncol(obs)]))
+sub_obs <- obs %>% dplyr::select(deployment_id, length)
+write.csv(sub_obs, file.path(tables_dir, "deployment_lengths.csv"), row.names = FALSE)
+```
+
+Your extra image-deployment filter (`P235|P240|P340`) is retained. These image counts therefore include more deployments than the occupancy model.
+
+```{r image-summary}
+img <- read.csv(file.path(data_dir, "images_2007979.csv"))
+img <- img %>%
+  dplyr::filter(
+    deployment_id %in% det_his_forordering$deployment_id |
+      grepl("P235|P240|P340", deployment_id)
+  )
+
+length(unique(img$deployment_id))
+setdiff(det_his_forordering$deployment_id, img$deployment_id)
+setdiff(img$deployment_id, det_his_forordering$deployment_id)
+
+img
+blank <- img %>% dplyr::filter(common_name == "Blank")
+
+dog <- img %>% dplyr::filter(img$common_name == "Domestic Dog")
+unique(dog$deployment_id)
+image_summary <- data.frame(
+  image_rows = nrow(img),
+  deployments = length(unique(img$deployment_id)),
+  blank_rows = nrow(blank),
+  deployments_with_dogs = length(unique(dog$deployment_id)))
+write.csv(image_summary, file.path(tables_dir, "image_summary.csv"), row.names = FALSE)
+write.csv(data.frame(deployment_id = setdiff(unique(img$deployment_id), det_his_forordering$deployment_id)),
+          file.path(tables_dir, "extra_image_deployments.csv"), row.names = FALSE)
+```
+
+```{r deployment-coordinates}
+dep <- det_his_forordering
+coord <- read.csv(file.path(data_dir, "filtered_deployments_detailed_func_dates3.csv")) %>%
+  dplyr::select(deployment_id, longitude, latitude)
+dep <- merge(dep, coord, by = "deployment_id", all.x = TRUE)
+write.csv(dep, file.path(tables_dir, "deployment_coordinates.csv"), row.names = FALSE)
+```
+
+## 9. Save the objects used by the figures
+
+This is the only results file that `02_figures.Rmd` needs. The CSV exports remain available for reading and checking results.
+
+```{r save-results}
+analysis_results <- list(
+  m6 = m6,
+  candidate_model_specs = candidate_model_specs,
+  model_comparison = model_comparison,
+  aicc_n_sites = aicc_n_sites,
+  rda1_threshold = rda1_threshold,
+  rda1_species_sets = rda1_species_sets,
+  rda1_richness_results = rda1_richness_results,
+  rda1_richness_summary = rda1_richness_summary,
+  rand_est = rand_est,
+  rand_est2 = rand_est2,
+  pred_comm = pred_comm,
+  df = df,
+  det_his_forordering = det_his_forordering,
+  site_cov_s = site_cov_s,
+  dates_s = dates_s,
+  y_comm = y_comm,
+  cor_matrix = cor_matrix,
+  nmds3 = nmds3,
+  nmds3_site = nmds3_site,
+  nmds_SpeciesScores3 = nmds_SpeciesScores3,
+  fireClass = fireClass,
+  en3 = en3,
+  en3_fu = en3_fu,
+  en3.2 = en3.2,
+  dispersion = dispersion,
+  rda_mod2 = rda_mod2,
+  df_selected = df_selected,
+  r2 = r2,
+  canopy_envfit = canopy_envfit,
+  vp = vp,
+  vp3 = vp3,
+  psi_sims = psi_sims,
+  nmds_sims = nmds_sims,
+  rda_sims = rda_sims,
+  rda_values = rda_values,
+  vp_sims = vp_sims,
+  vp_df = vp_df,
+  n_sims = n_sims,
+  ncs_fc = ncs_fc,
+  el97 = el97
+)
+saveRDS(analysis_results, file.path(results_dir, "analysis_results.rds"))
+capture.output(sessionInfo(), file = file.path(results_dir, "sessionInfo.txt"))
+```
+

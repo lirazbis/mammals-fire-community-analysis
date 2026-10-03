@@ -1,0 +1,14 @@
+.Rproj.user/
+.Rhistory
+.RData
+.Ruserdata
+.Renviron
+.Rprofile
+results/
+figures/
+*_cache/
+*_files/
+*.html
+Rplots.pdf
+.DS_Store
+Thumbs.db

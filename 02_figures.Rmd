@@ -1,0 +1,1318 @@
+---
+title: "Mammal occupancy figures"
+output:
+  html_document:
+    toc: true
+    code_folding: show
+---
+
+Run **setup** first, then run any figure chunk independently. The code below
+uses the saved analysis objects; it does not read the original data tables,
+fit models, run permutation tests, or generate new occupancy simulations.
+
+The ggplot blocks, object names, filenames, colors and dimensions come from
+your original document. Edit the relevant block directly. Change `figures_dir`
+to a new folder (for example `figures/reviewer_1/`) before a revision if you
+want to preserve the previous figures.
+
+## Setup: packages, saved results, and plotting data
+
+Open `Mammals_analysis.Rproj` first. All paths are relative to this archive
+folder. Run `01_analysis.Rmd` first to create `results/analysis_results.rds`;
+the assignments below restore the plotting objects from that saved list.
+The label lookups and `var_group()` function are from your original code.
+
+NMDS vector scaling and all species scores follow the final manuscript plots.
+Display labels use "Gray fox" and "Douglas squirrel"; original data keys stay unchanged.
+The five main manuscript outputs are `figure 2.png`, `figure 3 A.png`,
+`figure 3 B.png`, `figure 4 A.png`, and `figure 4 B.png`.
+
+```{r setup}
+knitr::opts_chunk$set(echo = TRUE, error = FALSE, cache = FALSE)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(vegan)
+library(ggrepel)
+library(patchwork)
+library(corrplot)
+library(grid)
+library(ggnewscale)
+
+results_dir <- "results"
+figures_dir <- file.path("figures", "final for submission")
+dir.create(figures_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(file.path(figures_dir, "simulations"), showWarnings = FALSE)
+
+saved_results_path <- file.path(results_dir, "analysis_results.rds")
+if (!file.exists(saved_results_path)) {
+  stop("No saved results in this archive. Run 01_analysis.Rmd first, then rerun figure setup.")
+}
+analysis_results <- readRDS(saved_results_path)
+# Display labels only: retain the original species keys in data and model objects.
+display_species_name <- function(x) {
+  x <- gsub("_", " ", x, fixed = TRUE)
+  x <- sub("^Grey Fox", "Gray Fox", x)
+  x <- sub("^Grey fox", "Gray fox", x)
+  sub("^Douglas(?:s|['\u2019]s)? [Ss]quirrel", "Douglas squirrel", x, perl = TRUE)
+}
+
+# Match each legend label to its mapped colour; omit the point symbols.
+guide_functional_group_text <- function() {
+  ggplot2::ggproto(
+    NULL,
+    ggplot2::guide_legend(
+      order = 2, override.aes = list(shape = NA, size = 0),
+      theme = ggplot2::theme(
+        legend.key.width = grid::unit(0, "pt"),
+        legend.text = ggplot2::element_text(margin = ggplot2::margin(l = 0))
+      )
+    ),
+    build_labels = function(key, elements, params) {
+      lapply(seq_len(nrow(key)), function(i) {
+        label_style <- elements$text
+        label_style$colour <- key$colour[i]
+        ggplot2::element_grob(label_style, label = key$.label[i],
+                             margin_x = TRUE, margin_y = TRUE)
+      })
+    }
+  )
+}
+
+# Shared styling for the vegetation and environmental NMDS figures.
+make_nmds_species_plot <- function(site_scores, species_scores, vector_scores,
+                                   func_colors, func_labels) {
+  species_scores$species <- display_species_name(species_scores$species)
+  membership <- c(
+    "Mule Deer" = "ground_gran", "American Black Bear" = "omni_carn",
+    "California Ground Squirrel" = "ground_gran",
+    "Golden Mantled Ground Squirrel" = "ground_gran",
+    "Douglas squirrel" = "canopy_gran", "Western Gray Squirrel" = "canopy_gran",
+    "Striped Skunk" = "omni_carn", "Coyote" = "omni_carn", "Gray Fox" = "omni_carn"
+  )
+  species_scores$functional_group <- unname(membership[species_scores$species])
+  stopifnot(nrow(species_scores) == 9L, !anyNA(species_scores$functional_group))
+  # Repel both types of label together so species and vector labels avoid each other.
+  plot_labels <- rbind(
+    data.frame(species_scores[c("NMDS1", "NMDS2")], label = species_scores$species,
+               colour_group = species_scores$functional_group, label_face = "plain"),
+    data.frame(vector_scores[c("NMDS1", "NMDS2")], label = vector_scores$label,
+               colour_group = "vector", label_face = "bold")
+  )
+  ggplot(site_scores, aes(NMDS1, NMDS2)) +
+    geom_point(aes(colour = severity_class_ha_rev), size = 4, alpha = 0.5) +
+    scale_colour_manual(
+      values = c(control = "#4575B4", low = "#FEE08B", lowlow = "#F46D43",
+                 mod = "#D73027", modplus = "magenta"),
+      labels = c(control = "unburned"), name = "Fire class",
+      guide = guide_legend(order = 1)
+    ) +
+    ggnewscale::new_scale_colour() +
+    geom_segment(data = vector_scores,
+                 aes(x = 0, y = 0, xend = NMDS1, yend = NMDS2),
+                 linewidth = 1, alpha = 0.5, colour = "darkblue") +
+    geom_point(data = species_scores, aes(colour = functional_group),
+               shape = 17, size = 3) +
+    ggrepel::geom_text_repel(
+      data = plot_labels, aes(label = label, colour = colour_group, fontface = label_face),
+      size = 4, show.legend = FALSE, seed = 42, max.overlaps = Inf,
+      box.padding = 0.5, point.padding = 0.35, min.segment.length = 0,
+      segment.color = NA,
+      segment.size = 0.25, force = 2, max.iter = 100000, max.time = 3
+    ) +
+    scale_colour_manual(
+      values = c(func_colors, vector = "darkblue"), breaks = names(func_labels),
+      labels = func_labels, name = "Functional group membership",
+      guide = guide_functional_group_text()
+    ) +
+    theme(
+      axis.title = element_text(size = 14, face = "bold", colour = "black"),
+      axis.text = element_text(size = 14, colour = "black"),
+      panel.background = element_blank(),
+      panel.border = element_rect(fill = NA, colour = "black"),
+      legend.key = element_blank(),
+      legend.title = element_text(size = 14, face = "bold", colour = "black"),
+      legend.text = element_text(size = 12, colour = "black"),
+      legend.position = "right", legend.box = "vertical"
+    )
+}
+
+df <- analysis_results$df
+cor_matrix <- analysis_results$cor_matrix
+nmds3_site <- analysis_results$nmds3_site
+nmds_SpeciesScores3 <- analysis_results$nmds_SpeciesScores3
+nmds_SpeciesScores3$species <- display_species_name(nmds_SpeciesScores3$species)
+fireClass <- analysis_results$fireClass
+en3 <- analysis_results$en3
+en3_fu <- analysis_results$en3_fu
+en3.2 <- analysis_results$en3.2
+dispersion <- analysis_results$dispersion
+rda_mod2 <- analysis_results$rda_mod2
+r2 <- analysis_results$r2
+canopy_envfit <- analysis_results$canopy_envfit
+vp <- analysis_results$vp
+vp3 <- analysis_results$vp3
+nmds_sims <- analysis_results$nmds_sims
+rda_sims <- analysis_results$rda_sims
+vp_sims <- analysis_results$vp_sims
+rda_values <- analysis_results$rda_values
+n_sims <- analysis_results$n_sims
+ncs_fc <- analysis_results$ncs_fc
+el97 <- analysis_results$el97
+placeholder <- ""
+
+label_lookup <- c(
+  "lg_snag_ha"                                  = "Large snag density",
+  "dens_lg"                                     = "Large tree density",
+  "dens_md"                                     = "Medium tree density",
+  "cwd_m3_"                                     = "Coarse woody debris",
+  "fuel_kgha"                                   = "Fine woody debris",
+  "gr.mean.percent.shrub"                       = "Shrub cover",
+  "gr.mean.percent.herbGrass"                   = "Herbs and grass cover",
+  "mean_cc_90"                                  = "Canopy cover",
+  "vert_div"                                    = "Vertical diversity",
+  "tree_rich"                                   = "Tree species richness",
+  "herb_rich"                                   = "Herbs richness",
+  "shrub_rich"                                  = "Shrub species richness",
+  "Snag_Density_Diameter_Med_per_Hectare"       = "Medium snag density",
+  "Densiometer_CV"                              = "Densiometer CV",
+  "Tree.Density.Diameter.Class.Saplings.Hectare" = "Sapling tree density",
+  "Tree.Density.Diameter.Class.Small.Hectare"  = "Small tree density",
+  "topo_prod_mean_1ha"                          = "Topographic productivity index",
+  "aet_mean_1ha"                                = "Actual evapotranspiration",
+  "cwd_mean_1ha"                                = "Climatic water deficit",
+  "elevation_mean_1ha"                          = "Elevation",
+  "y_ca_alb"                                    = "Y-coordinate",
+  "tslf_composite"                              = "Time since last fire",
+  "max_sev_since_2015"                          = "Max severity since 2015",
+  "max_sev_since_2000"                          = "Max severity since 2000",
+  "mod_n"                                       = "Moderate fire count",
+  "fire_n_1984_2024"                            = "Fire count 1984-2024",
+  "burn_prop_1950_1983"                         = "Burn proportion 1950-1983",
+  "burn_prop_1900_1949"                         = "Burn proportion 1900-1949",
+  "tslf_composite_c0-3"                         = "TSLF 0-3yr",
+  "tslf_composite_c3-38"                        = "TSLF 3-38yr",
+  "tslf_composite_c38+"                         = "TSLF 38+yr",
+  "max_sev_since_20000"                         = "Unburned since 2000",
+  "max_sev_since_20001"                         = "Max low since 2000",
+  "max_sev_since_20002"                         = "Max mod since 2000",
+  "max_sev_since_20150"                         = "Unburned since 2015",
+  "max_sev_since_20151"                         = "Max low since 2015",
+  "max_sev_since_20152"                         = "Max mod since 2015"
+)
+
+func_labels <- c(
+  "omni_carn"   = "Omnivore-carnivores",
+  "ground_gran" = "Ground herbivores and granivores",
+  "canopy_gran" = "Canopy herbivores and granivores"
+)
+
+func_colors <- c(omni_carn = "#008837", ground_gran = "red3", canopy_gran = "#E66101")
+
+env_vars_all <- c("topo_prod_mean_1ha", "aet_mean_1ha", "cwd_mean_1ha", "elevation_mean_1ha", "y_ca_alb")
+veg_vars_all <- c("lg_snag_ha", "dens_lg", "dens_md", "cwd_m3_", "fuel_kgha",
+                  "gr.mean.percent.shrub", "gr.mean.percent.herbGrass", "mean_cc_90",
+                  "vert_div", "tree_rich", "herb_rich", "shrub_rich",
+                  "Snag_Density_Diameter_Med_per_Hectare", "Densiometer_CV",
+                  "Tree.Density.Diameter.Class.Saplings.Hectare",
+                  "Tree.Density.Diameter.Class.Small.Hectare")
+fire_vars_all <- c("tslf_composite", "tslf_composite_c", "max_sev_since_2015",
+                    "max_sev_since_2000", "max_sev_since_2010", "max_sev_since_2020",
+                    "mod_n", "fire_n_1984_2024", "burn_prop_1950_1983", "burn_prop_1900_1949",
+                    "fire_1_num", "fire_2_num", "fire_3_num", "max_sev_all", "max_sev_recent2")
+
+var_group <- function(x) {
+  all_vars <- c(env_vars_all, veg_vars_all, fire_vars_all)
+  vapply(x, function(v) {
+    m <- all_vars[startsWith(v, all_vars)]
+    base <- if (length(m) > 0) m[which.max(nchar(m))] else v
+    if (base %in% env_vars_all) "environment"
+    else if (base %in% veg_vars_all) "vegetation"
+    else if (base %in% fire_vars_all) "fire"
+    else "vegetation"
+  }, character(1), USE.NAMES = FALSE)
+}
+
+group_cols <- c(environment = "blue", vegetation = "forestgreen", fire = "red")
+fire_cols <- c(
+  "lowlow"  = "#F46D43",
+  "low"     = "#FEE08B",
+  "mod"     = "#D73027",
+  "modplus" = "magenta",
+  "control" = "#4575B4"
+)
+
+species_abbrev <- c(
+  "American_Black_Bear"           = "ABB",
+  "Mule_Deer"                     = "MD",
+  "Coyote"                        = "COY",
+  "Golden_Mantled_Ground_Squirrel" = "GMGS",
+  "Douglass_Squirrel"             = "DS",
+  "Western_Gray_Squirrel"         = "WGS",
+  "Grey_Fox"                      = "GF",
+  "Striped_Skunk"                 = "STS",
+  "California_Ground_Squirrel"    = "CGS"
+)
+
+fire_colours <- fire_cols
+fireClass.hull12 <- nmds3_site %>%
+  dplyr::group_by(severity_class_ha_rev) %>%
+  dplyr::slice(chull(NMDS1, NMDS2))
+
+# Reproduce the manuscript's ordiArrowMul display scaling with a fixed
+# 0-1 graphics region. This is independent of the active graphics device.
+manuscript_arrow_multiplier <- function(fit) {
+  xy <- vegan::scores(fit, display = "vectors")[, 1:2, drop = FALSE]
+  ranges <- c(range(xy[, 1], na.rm = TRUE), range(xy[, 2], na.rm = TRUE))
+  ratios <- c(0, 1, 0, 1) / ranges
+  0.75 * min(ratios[is.finite(ratios) & ratios > 0])
+}
+en_coord_cont3 <- as.data.frame(scores(en3, "vectors")) * manuscript_arrow_multiplier(en3)
+en_coord_cont3$label <- ifelse(rownames(en_coord_cont3) %in% names(label_lookup),
+  label_lookup[rownames(en_coord_cont3)], rownames(en_coord_cont3))
+en_coord_cont3 <- en_coord_cont3 %>%
+  dplyr::filter(!label %in% c("Y-coordinate", "Elevation", "Topographic productivity index",
+                            "Actual evapotranspiration", "Climatic water deficit"))
+en_coord_cont3_fu <- as.data.frame(scores(en3_fu, "vectors")) * manuscript_arrow_multiplier(en3_fu)
+en_coord_cont3_fu$label <- func_labels[rownames(en_coord_cont3_fu)]
+en_coord_cont3.2 <- as.data.frame(scores(en3.2, "vectors")) * manuscript_arrow_multiplier(en3.2)
+en_coord_cont3.2$label <- ifelse(rownames(en_coord_cont3.2) %in% names(label_lookup),
+  label_lookup[rownames(en_coord_cont3.2)], rownames(en_coord_cont3.2))
+site_sc <- as.data.frame(scores(rda_mod2, display = "sites"))
+sp_sc   <- as.data.frame(scores(rda_mod2, display = "species"))
+env_sc  <- as.data.frame(scores(rda_mod2, display = "bp"))
+
+env_sc$label <- ifelse(
+  rownames(env_sc) %in% names(label_lookup),
+  label_lookup[rownames(env_sc)],
+  rownames(env_sc)
+)
+env_sc$group <- var_group(rownames(env_sc))
+sp_sc$label <- display_species_name(rownames(sp_sc))
+
+sp_sc$nudge_x <- 0
+sp_sc$nudge_y <- 0
+sp_sc$nudge_y[sp_sc$label == "California Ground Squirrel"] <- -0.01
+sp_sc$nudge_x[sp_sc$label == "California Ground Squirrel"] <- 0.03
+
+site_sc <- cbind(fireClass, site_sc)
+
+hull_rda <- site_sc %>%
+  dplyr::group_by(severity_class_ha_rev) %>%
+  dplyr::slice(chull(RDA1, RDA2))
+
+eig_c <- rda_mod2$CCA$eig
+tot_i <- rda_mod2$tot.chi
+pct1  <- round(100 * eig_c[1] / tot_i, 1)
+pct2  <- round(100 * eig_c[2] / tot_i, 1)
+ax1   <- paste0("RDA1 (", pct1, "% of total inertia)")
+ax2   <- paste0("RDA2 (", pct2, "% of total inertia)")
+sp_sc$abbrev <- unname(species_abbrev[rownames(sp_sc)])
+
+stopifnot(!anyNA(sp_sc$abbrev))
+canopy_sc <- as.data.frame(scores(canopy_envfit, display = "vectors"))
+canopy_sc$label <- label_lookup["mean_cc_90"]
+sp_cols <- c(
+  "American_Black_Bear", "Coyote", "Grey_Fox", "Striped_Skunk",
+  "Mule_Deer", "California_Ground_Squirrel", "Golden_Mantled_Ground_Squirrel",
+  "Western_Gray_Squirrel", "Douglass_Squirrel"
+)
+
+sp_labels <- c(
+  "American_Black_Bear"              = "American black bear",
+  "Coyote"                           = "Coyote",
+  "Grey_Fox"                         = "Gray fox",
+  "Striped_Skunk"                    = "Striped skunk",
+  "Mule_Deer"                       = "Mule deer",
+  "California_Ground_Squirrel"       = "California ground squirrel",
+  "Golden_Mantled_Ground_Squirrel"   = "Golden-mantled ground squirrel",
+  "Western_Gray_Squirrel"            = "Western gray squirrel",
+  "Douglass_Squirrel"                = "Douglas squirrel"
+)
+
+occu_long <- df %>%
+  dplyr::select(severity_class_ha_rev, dplyr::all_of(sp_cols)) %>%
+  tidyr::pivot_longer(cols = dplyr::all_of(sp_cols),
+                      names_to = "species", values_to = "psi") %>%
+  dplyr::mutate(
+    species    = factor(sp_labels[species], levels = sp_labels[sp_cols]),
+    fire_class = factor(severity_class_ha_rev,
+                        levels = c("lowlow", "low", "mod", "modplus", "control"),
+                        labels = c("lowlow", "low", "mod", "modplus", "unburned"))
+  )
+```
+
+## Figure 2: occupancy by fire class
+
+The `occupancy-functional-groups` chunk creates the complete manuscript figure.
+The older nine-panel alternative below is kept for reference and is not run when knitting.
+
+```{r occupancy-boxplots, eval=FALSE}
+ggplot(occu_long, aes(x = factor(fire_class, levels = c("unburned", "low", "lowlow", "mod", "modplus")), y = psi, fill = fire_class)) +
+  geom_boxplot(outlier.size = 1) +
+  facet_wrap(~ species, scales = "free_y", ncol = 3) +
+  scale_fill_manual(values = c(
+    "lowlow"   = "#F46D43",
+    "low"      = "#FEE08B",
+    "mod"      = "#D73027",
+    "modplus"  = "magenta",
+    "unburned" = "#4575B4"
+  )) +
+  labs(x = "Fire class", y = "Predicted occupancy (ψ)", fill = "Fire class") +
+  theme_bw() +
+  theme(
+    axis.title       = element_text(size = 16, face = "bold", colour = "black"),
+    axis.text        = element_text(size = 13, colour = "black"),
+    axis.text.x      = element_text(angle = 30, hjust = 1),
+    panel.background = element_blank(),
+    panel.border     = element_rect(fill = NA, colour = "black"),
+    strip.text       = element_text(size = 14, face = "italic", colour = "black"),
+    strip.background = element_blank(),
+    legend.key       = element_blank(),
+    legend.title     = element_text(size = 15, face = "bold", colour = "black"),
+    legend.text      = element_text(size = 13, colour = "black")
+  ) +
+  ylim(0,1)
+ggsave(file.path(figures_dir, "occu_boxplots_fireclass_ordered2.png"), width = 300, height = 250, units = "mm", dpi = 500)
+```
+
+This keeps the latest combined layout, enlarged text, and separate occupancy and richness axes. All plotting code is included here.
+
+```{r occupancy-functional-groups}
+# Figure 2 is generated entirely here as one combined figure.
+# Regroup the saved occupancy predictions; no occupancy models are refitted.
+# Individual-species values, fire-class colors, 0-1 limits, and boxplot statistics
+# follow the existing manuscript code. Overall panels sum species within each site.
+
+make_mammal_boxplots_regrouped <- function(data, output_dir) {
+  figure2_font_scale <- 1.25  # Enlarge Figure 2 text; vertical titles are 14 pt to fit both rows.
+  required <- c("ggplot2", "patchwork", "ragg")
+  missing <- required[!vapply(required, requireNamespace, logical(1), quietly = TRUE)]
+  if (length(missing)) stop("Missing packages: ", paste(missing, collapse = ", "))
+  library(ggplot2)
+  library(patchwork)
+
+  groups <- list(
+    ground = c("Mule_Deer", "California_Ground_Squirrel", "Golden_Mantled_Ground_Squirrel"),
+    canopy = c("Western_Gray_Squirrel", "Douglass_Squirrel"),
+    omni = c("American_Black_Bear", "Coyote", "Grey_Fox", "Striped_Skunk")
+  )
+  species <- unlist(groups, use.names = FALSE)
+  species_labels <- c(
+    Mule_Deer = "Mule deer",
+    California_Ground_Squirrel = "California ground\nsquirrel",
+    Golden_Mantled_Ground_Squirrel = "Golden-mantled\nground squirrel",
+    Western_Gray_Squirrel = "Western gray\nsquirrel",
+    Douglass_Squirrel = "Douglas squirrel",
+    American_Black_Bear = "American black\nbear",
+    Coyote = "Coyote",
+    Grey_Fox = "Gray fox",
+    Striped_Skunk = "Striped skunk"
+  )
+  fire_levels <- c("unburned", "low", "lowlow", "mod", "modplus")
+  fire_colors <- c(unburned = "#4575B4", low = "#FEE08B", lowlow = "#F46D43",
+                   mod = "#D73027", modplus = "magenta")
+  data <- as.data.frame(data)
+  rownames(data) <- NULL  # Saved objects may carry row names; retain the same row order.
+  stopifnot(all(c("deployment_id", "severity_class_ha_rev", species) %in% names(data)),
+            nrow(data) == 97L, !anyNA(data$deployment_id), !anyDuplicated(data$deployment_id))
+  predictions <- as.matrix(data[, species, drop = FALSE])
+  stopifnot(is.numeric(predictions), all(is.finite(predictions)),
+            all(predictions >= 0 & predictions <= 1))
+  fire_class <- factor(ifelse(data$severity_class_ha_rev == "control", "unburned",
+                              data$severity_class_ha_rev), levels = fire_levels)
+  stopifnot(!anyNA(fire_class), identical(as.integer(table(fire_class)), c(20L, 19L, 18L, 17L, 23L)))
+  sums <- data.frame(deployment_id = data$deployment_id, fire_class = fire_class,
+                    all_species = rowSums(predictions), stringsAsFactors = FALSE)
+  for (group in names(groups)) {
+    sums[[group]] <- rowSums(data[, groups[[group]], drop = FALSE])
+  }
+  stopifnot(isTRUE(all.equal(sums$all_species, rowSums(sums[, names(groups)]))))
+  dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+
+  base_theme <- theme_bw(base_size = 12.5 * figure2_font_scale, base_family = "Arial") + theme(
+    axis.title = element_blank(),
+    axis.text = element_text(size = 11 * figure2_font_scale, colour = "black"),
+    axis.text.x = element_text(angle = 35, hjust = 1),
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank(),
+    panel.grid.major.y = element_line(colour = "grey91", linewidth = 0.25),
+    panel.border = element_rect(fill = NA, colour = "black", linewidth = 0.45),
+    plot.title = element_text(size = 12.5 * figure2_font_scale, face = "italic", hjust = 0.5,
+                              margin = margin(b = 6), lineheight = 1.05),
+    plot.margin = margin(6, 7, 5, 7),
+    legend.position = "none"
+  )
+
+  make_box <- function(values, title, overall = FALSE, maximum = 1) {
+    plot_data <- data.frame(fire_class = fire_class, value = values)
+    p <- ggplot(plot_data, aes(fire_class, value, fill = fire_class)) +
+      geom_boxplot(outlier.size = 1) +
+      scale_fill_manual(values = fire_colors, drop = FALSE) +
+      scale_x_discrete(drop = FALSE) +
+      labs(title = title, x = NULL, y = NULL) + base_theme
+    if (overall) {
+      p <- p + scale_y_continuous(limits = c(0, maximum), breaks = 0:maximum,
+                                  expand = expansion(mult = 0.05)) +
+        labs(y = "Expected richness") +
+        theme(plot.title = element_text(face = "bold"),
+              axis.title.y = element_text(size = 14, margin = margin(r = 7)),
+              panel.background = element_rect(fill = "grey97", colour = NA))
+    } else {
+      p <- p + scale_y_continuous(limits = c(0, 1), breaks = seq(0, 1, 0.25))
+    }
+    p
+  }
+  individual <- lapply(species, function(sp) make_box(data[[sp]], species_labels[[sp]]))
+  names(individual) <- species
+  overall <- list(all = make_box(sums$all_species, "All nine species", TRUE, 9))
+  for (group in names(groups)) {
+    overall[[group]] <- make_box(sums[[group]], "Overall richness", TRUE,
+                                 length(groups[[group]]))
+  }
+
+  # Verify that regrouping has not changed any species' boxplot statistics.
+  stat_columns <- c("group", "ymin", "lower", "middle", "upper", "ymax")
+  for (sp in species) {
+    reference <- ggplot(data.frame(fire_class, psi = data[[sp]]),
+                        aes(fire_class, psi, fill = fire_class)) +
+      geom_boxplot(outlier.size = 1) + ylim(0, 1)
+    old_stats <- ggplot_build(reference)$data[[1]]
+    new_stats <- ggplot_build(individual[[sp]])$data[[1]]
+    stopifnot(isTRUE(all.equal(old_stats[, stat_columns], new_stats[, stat_columns])),
+              isTRUE(all.equal(old_stats$outliers, new_stats$outliers)))
+  }
+
+  group_title <- function(label) wrap_elements(full = grid::textGrob(
+    label, x = 0, hjust = 0, gp = grid::gpar(fontfamily = "Arial", fontsize = 15 * figure2_font_scale, fontface = "bold")))
+  add_x_axis <- function(plot) {
+    x <- wrap_elements(full = grid::textGrob("Fire-history class",
+        gp = grid::gpar(fontfamily = "Arial", fontsize = 14 * figure2_font_scale)))
+    wrap_plots(list(plot, x), ncol = 1, heights = c(1, 0.045))
+  }
+  label_occupancy <- function(plot) {
+    plot + labs(y = "Predicted occupancy (\u03c8)") +
+      theme(axis.title.y = element_text(size = 14, margin = margin(r = 7)))
+  }
+  make_group <- function(group, pad = TRUE) {
+    species_panels <- unname(individual[groups[[group]]])
+    species_panels[[1]] <- label_occupancy(species_panels[[1]])
+    if (group == "omni") {
+      # Two rows of species, with the overall summary at the end of the second row.
+      species_panels[[3]] <- label_occupancy(species_panels[[3]])
+      top <- c(species_panels[1:2], list(plot_spacer()))
+      bottom <- c(species_panels[3:4], list(overall[[group]]))
+      if (pad) {
+        top <- c(top, list(plot_spacer()))
+        bottom <- c(bottom, list(plot_spacer()))
+      }
+      return(wrap_plots(c(top, bottom), ncol = length(top)))
+    }
+    panels <- c(species_panels, list(overall[[group]]))
+    if (pad) panels <- c(panels, rep(list(plot_spacer()), 4L - length(panels)))
+    wrap_plots(panels, nrow = 1)
+  }
+
+  # A compact fire-class key uses the space beside the single community summary.
+  key_labels <- c("Unburned: no recorded fire", "Low: one low-severity fire",
+                  "Lowlow: repeated low-severity fires", "Mod: one moderate-severity fire",
+                  "Modplus: repeated fires, at least one moderate-severity fire")
+  key_grobs <- list(grid::textGrob("Fire-history classes", x = 0.025, y = 0.96,
+      hjust = 0, gp = grid::gpar(fontfamily = "Arial", fontsize = 13 * figure2_font_scale, fontface = "bold")))
+  for (i in seq_along(fire_levels)) {
+    yy <- 0.83 - (i - 1) * 0.145
+    key_grobs <- c(key_grobs, list(
+      grid::rectGrob(x = 0.043, y = yy, width = 0.030, height = 0.065,
+                     gp = grid::gpar(fill = fire_colors[[fire_levels[i]]], col = "grey30")),
+      grid::textGrob(key_labels[i], x = 0.08, y = yy, hjust = 0,
+                     gp = grid::gpar(fontfamily = "Arial", fontsize = 12 * figure2_font_scale))
+    ))
+  }
+  key <- wrap_elements(full = do.call(grid::grobTree, key_grobs))
+  row_a <- wrap_plots(list(overall$all, key), nrow = 1, widths = c(1, 3))
+  row_b <- make_group("ground")
+  row_c <- make_group("canopy")
+  row_d <- make_group("omni")
+  titles <- c("All species", "Ground herbivores and granivores",
+              "Canopy herbivores and granivores", "Omnivore-carnivores")
+  plate_content <- wrap_plots(list(group_title(titles[1]), row_a,
+                                   group_title(titles[2]), row_b,
+                                   group_title(titles[3]), row_c,
+                                   group_title(titles[4]), row_d),
+                             ncol = 1, heights = c(0.10, 1, 0.10, 1, 0.10, 1, 0.10, 2))
+  plate <- add_x_axis(plate_content)
+
+  ggplot2::ggsave(file.path(output_dir, "figure 2.png"), plot = plate,
+                  device = ragg::agg_png, width = 300, height = 400, units = "mm",
+                  dpi = 500, bg = "white", limitsize = FALSE)
+  invisible(list(figure = plate, summaries = sums))
+}
+regrouped_boxplots <- make_mammal_boxplots_regrouped(data = df, output_dir = figures_dir)
+regrouped_boxplots$figure
+```
+
+## Figure 3: NMDS
+
+```{r nmds-fire-classes}
+ggplot(
+  data = nmds3_site,
+  aes(x = NMDS1, y = NMDS2)
+) +
+  geom_point(
+    aes(colour = severity_class_ha_rev),
+    size = 4, alpha = 0.5
+  ) +
+  geom_polygon(
+    data = fireClass.hull12,
+    aes(
+      x = NMDS1, y = NMDS2,
+      fill = severity_class_ha_rev,
+      group = severity_class_ha_rev
+    ),
+    alpha = 0.30
+  ) +
+    geom_text(
+    data = nmds_SpeciesScores3,
+    aes(x = NMDS1, y = NMDS2, label = species),
+    size = 5
+  ) +
+    scale_fill_manual(
+    values = c(
+      "lowlow" = "#F46D43",
+      "low" = "#FEE08B",
+      "mod" = "#D73027",
+      "modplus" = "magenta",
+      "control" = "#4575B4"),
+    labels = c("control" = "unburned")) +
+      scale_colour_manual(
+    values = c(
+      "lowlow" = "#F46D43",
+      "low" = "#FEE08B",
+      "mod" = "#D73027",
+      "modplus" = "magenta",
+      "control" = "#4575B4"),
+    labels = c("control" = "unburned")) +
+  theme(
+    axis.title = element_text(size = 14, face = "bold", colour = "black"),
+    panel.background = element_blank(),
+    panel.border = element_rect(fill = NA, colour = "black"),
+    axis.text = element_text(size = 14, colour = "black"),
+    legend.key = element_blank(),
+    legend.title = element_text(size = 19, face = "bold", colour = "black"),
+    legend.text = element_text(size = 18, colour = "black")
+  ) +
+  labs(colour = "Fire class", fill = "Fire class")
+
+ggsave(file.path(figures_dir, "NMDS12_convex.png"), width = 300, height = 150, units = "mm", dpi = 500)
+```
+
+```{r nmds-vegetation}
+p_nmds_cova <- make_nmds_species_plot(
+  nmds3_site, nmds_SpeciesScores3, en_coord_cont3, func_colors, func_labels
+) +
+  labs(title = "A. Vegetation characteristics") +
+  theme(plot.title = element_text(size = 16, face = "bold", hjust = 0))
+print(p_nmds_cova)
+ggsave(file.path(figures_dir, "figure 3 A.png"), plot = p_nmds_cova, device = ragg::agg_png,
+       width = 300, height = 200, units = "mm", dpi = 500, bg = "white")
+```
+
+```{r nmds-functional-groups}
+ggplot(
+  data = nmds3_site,
+  aes(x = NMDS1, y = NMDS2)
+) +
+  geom_point(
+    aes(colour = severity_class_ha_rev),
+    size = 4, alpha = 0.5
+  ) +
+  geom_segment(
+    aes(x = 0, y = 0, xend = NMDS1, yend = NMDS2),
+    data = en_coord_cont3_fu, size = 1, alpha = 0.5, colour = "darkblue"
+  ) +
+  geom_text_repel(
+    data = en_coord_cont3_fu,
+    aes(x = NMDS1, y = NMDS2, label = label),
+    size = 6,
+    colour = "darkblue",
+    fontface = "bold"
+  ) +
+  geom_text_repel(
+    data = nmds_SpeciesScores3,
+    aes(x = NMDS1, y = NMDS2, label = species),
+    size = 6,
+    colour = "black"
+  ) +
+      scale_colour_manual(
+    values = c(
+      "lowlow" = "#F46D43",
+      "low" = "#FEE08B",
+      "mod" = "#D73027",
+      "modplus" = "magenta",
+      "control" = "#4575B4"),
+    labels = c("control" = "unburned")) +
+  theme(
+    axis.title = element_text(size = 15, face = "bold", colour = "black"),
+    panel.background = element_blank(),
+    panel.border = element_rect(fill = NA, colour = "black"),
+    axis.ticks = element_blank(),
+    axis.text = element_text(size = 15, colour = "black"),
+    legend.key = element_blank(),
+    legend.title = element_text(size = 20, face = "bold", colour = "black"),
+    legend.text = element_text(size = 19, colour = "black")
+  ) +
+  labs(colour = "Fire class", fill = "Fire class")
+
+ggsave(file.path(figures_dir, "NMDS12_func2.png"), width = 300, height = 150, units = "mm", dpi = 500)
+```
+
+```{r nmds-environment}
+p_nmds_env <- make_nmds_species_plot(
+  nmds3_site, nmds_SpeciesScores3, en_coord_cont3.2, func_colors, func_labels
+) +
+  labs(title = "B. Environmental characteristics") +
+  theme(plot.title = element_text(size = 16, face = "bold", hjust = 0))
+print(p_nmds_env)
+ggsave(file.path(figures_dir, "figure 3 B.png"), plot = p_nmds_env, device = ragg::agg_png,
+       width = 300, height = 150, units = "mm", dpi = 500, bg = "white")
+```
+
+## Figure 4: all-predictor RDA
+
+The species-only panel is Figure 4A; species abbreviations plus predictor
+arrows are Figure 4B. The optional canopy-overlay version is retained below.
+
+```{r rda-species-functional-groups}
+# Species labels and groups are keyed by species name, independent of row order.
+rda_species_labels <- c(
+  "Mule_Deer" = "Mule Deer (MD)",
+  "American_Black_Bear" = "American Black Bear (ABB)",
+  "California_Ground_Squirrel" = "California Ground Squirrel (CGS)",
+  "Golden_Mantled_Ground_Squirrel" = "Golden Mantled Ground Squirrel (GMGS)",
+  "Douglass_Squirrel" = "Douglas squirrel (DS)",
+  "Western_Gray_Squirrel" = "Western Gray Squirrel (WGS)",
+  "Striped_Skunk" = "Striped Skunk (STS)",
+  "Coyote" = "Coyote (COY)",
+  "Grey_Fox" = "Gray Fox (GF)"
+)
+rda_species_groups <- c(
+  "Mule_Deer" = "ground_gran",
+  "American_Black_Bear" = "omni_carn",
+  "California_Ground_Squirrel" = "ground_gran",
+  "Golden_Mantled_Ground_Squirrel" = "ground_gran",
+  "Douglass_Squirrel" = "canopy_gran",
+  "Western_Gray_Squirrel" = "canopy_gran",
+  "Striped_Skunk" = "omni_carn",
+  "Coyote" = "omni_carn",
+  "Grey_Fox" = "omni_carn"
+)
+rda_func_colors <- c("ground_gran" = "red3", "omni_carn" = "#008837", "canopy_gran" = "#E66101")
+rda_func_labels <- c("ground_gran" = "Ground herbivores and granivores",
+                     "omni_carn" = "Omnivore-carnivores",
+                     "canopy_gran" = "Canopy herbivores and granivores")
+sp_sc$labelabrv <- unname(rda_species_labels[rownames(sp_sc)])
+sp_sc$functional_group <- factor(unname(rda_species_groups[rownames(sp_sc)]),
+                                  levels = names(rda_func_colors))
+stopifnot(!anyNA(sp_sc$labelabrv), !anyNA(sp_sc$functional_group))
+
+p_rda_species_groups <- ggplot(site_sc, aes(x = RDA1, y = RDA2)) +
+  geom_point(aes(colour = severity_class_ha_rev), size = 3, alpha = 0.7) +
+  scale_colour_manual(name = "Fire class", values = fire_cols,
+                      labels = c("control" = "unburned"),
+                      guide = guide_legend(order = 1)) +
+  ggnewscale::new_scale_colour() +
+  geom_point(data = sp_sc, aes(colour = functional_group), shape = 17, size = 3) +
+  geom_text_repel(
+    data = sp_sc, aes(label = labelabrv, colour = functional_group),
+    fontface = "bold", size = 5, segment.color = NA, show.legend = FALSE,
+    max.overlaps = Inf, box.padding = 0.6, point.padding = 0.3, seed = 42,
+    force = 3, force_pull = 0.5, max.iter = 50000, max.time = 2,
+    nudge_x = sp_sc$nudge_x,
+    # Keep the CGS label close to its triangle in this species-only panel.
+    nudge_y = ifelse(rownames(sp_sc) == "California_Ground_Squirrel", 0, sp_sc$nudge_y)
+  ) +
+  scale_colour_manual(name = "Functional group membership", values = rda_func_colors,
+                      labels = rda_func_labels,
+                      guide = guide_functional_group_text()) +
+  labs(x = ax1, y = ax2, title = NULL, subtitle = NULL, tag = "A") +
+  theme(
+    plot.tag = element_text(size = 18, face = "bold"),
+    plot.tag.position = "topleft",
+    axis.title = element_text(size = 14, face = "bold", colour = "black"),
+    axis.text = element_text(size = 14, colour = "black"),
+    panel.background = element_blank(),
+    panel.border = element_rect(fill = NA, colour = "black"),
+    legend.key = element_blank(),
+    legend.title = element_text(size = 14, face = "bold", colour = "black"),
+    legend.text = element_text(size = 12, colour = "black"),
+    legend.position = "right", legend.box = "vertical"
+  )
+print(p_rda_species_groups)
+ggsave(file.path(figures_dir, "figure 4 A.png"),
+       plot = p_rda_species_groups, device = ragg::agg_png, bg = "white", width = 300, height = 200, units = "mm", dpi = 500)
+```
+
+```{r rda-all-predictors}
+# Fire-label positions: first = low, second = mod
+fire_labels <- dplyr::filter(env_sc, group == "fire")
+
+# EDIT THESE TWO LINES:
+# Horizontal: positive = right, negative = left
+fire_labels$label_x <- fire_labels$RDA1 + c(0, 0)
+# Vertical: positive = up, negative = down
+fire_labels$label_y <- fire_labels$RDA2 + c(0.06, 0.03)
+
+p_rda_predictors <- ggplot(site_sc, aes(x = RDA1, y = RDA2)) +
+
+  geom_point(
+    aes(colour = severity_class_ha_rev),
+    size = 3, alpha = 0.7
+  ) +
+
+  # Environment arrows and labels
+  geom_segment(
+    data = dplyr::filter(env_sc, group == "environment"),
+    aes(x = 0, y = 0, xend = RDA1, yend = RDA2),
+    arrow = arrow(length = unit(0.25, "cm")),
+    colour = group_cols["environment"],
+    linewidth = 0.8, alpha = 0.5
+  ) +
+  geom_text_repel(
+    data = dplyr::filter(env_sc, group == "environment"),
+    aes(x = RDA1, y = RDA2, label = label),
+    colour = group_cols["environment"],
+    fontface = "bold", size = 5.5,
+    max.overlaps = Inf, box.padding = 0.5,
+    point.padding = 0.3, min.segment.length = 0, seed = 42
+  ) +
+
+  # Vegetation arrows and labels
+  geom_segment(
+    data = dplyr::filter(env_sc, group == "vegetation"),
+    aes(x = 0, y = 0, xend = RDA1, yend = RDA2),
+    arrow = arrow(length = unit(0.25, "cm")),
+    colour = group_cols["vegetation"],
+    linewidth = 0.8, alpha = 0.5
+  ) +
+  geom_text_repel(
+    data = dplyr::filter(env_sc, group == "vegetation"),
+    aes(x = RDA1, y = RDA2, label = label),
+    colour = group_cols["vegetation"],
+    fontface = "bold", size = 5.5,
+    max.overlaps = Inf, box.padding = 0.5,
+    point.padding = 0.3, min.segment.length = 0, seed = 42
+  ) +
+
+  # Fire arrows retain their original endpoints
+  geom_segment(
+    data = dplyr::filter(env_sc, group == "fire"),
+    aes(x = 0, y = 0, xend = RDA1, yend = RDA2),
+    arrow = arrow(length = unit(0.25, "cm")),
+    colour = group_cols["fire"],
+    linewidth = 0.8, alpha = 0.5
+  ) +
+
+  # Fire labels use the exact positions defined above
+  geom_text(
+    data = fire_labels,
+    aes(x = label_x, y = label_y, label = label),
+    colour = group_cols["fire"],
+    fontface = "bold", size = 5.5
+  ) +
+
+  # Species triangles and labels
+  geom_point(
+    data = sp_sc,
+    aes(x = RDA1, y = RDA2),
+    shape = 17, size = 3, colour = "black"
+  ) +
+  geom_text_repel(
+    data = sp_sc,
+    aes(x = RDA1, y = RDA2, label = abbrev),
+    colour = "black", fontface = "bold", size = 5,
+    segment.color = NA,
+    max.overlaps = Inf, box.padding = 0.6,
+    point.padding = 0.3, seed = 42,
+    force = 3, force_pull = 0.5,
+    max.iter = 50000, max.time = 2,
+    nudge_x = sp_sc$nudge_x,
+    nudge_y = sp_sc$nudge_y
+  ) +
+
+  scale_fill_manual(
+    values = fire_cols, labels = c("control" = "unburned")
+  ) +
+  scale_colour_manual(
+    values = fire_cols, labels = c("control" = "unburned")
+  ) +
+  labs(
+    x = ax1, y = ax2,
+    colour = "Fire class", fill = "Fire class",
+    title = NULL, subtitle = NULL, tag = "B"
+  ) +
+  theme(
+    plot.tag = element_text(size = 18, face = "bold"),
+    plot.tag.position = "topleft",
+    axis.title = element_text(size = 14, face = "bold", colour = "black"),
+    axis.text = element_text(size = 14, colour = "black"),
+    panel.background = element_blank(),
+    panel.border = element_rect(fill = NA, colour = "black"),
+    legend.key = element_blank(),
+    legend.title = element_text(size = 19, face = "bold", colour = "black"),
+    legend.text = element_text(size = 18, colour = "black")
+  ) +
+  ylim(-0.7, 0.7) +
+  xlim(-1, 0.8)
+
+print(p_rda_predictors)
+ggsave(file.path(figures_dir, "figure 4 B.png"), plot = p_rda_predictors,
+       device = ragg::agg_png, bg = "white", width = 300, height = 200, units = "mm", dpi = 500)
+```
+
+Optional version of the same all-predictor RDA with your dashed canopy envfit overlay.
+
+```{r rda-canopy-overlay, eval=FALSE}
+ggplot(site_sc, aes(x = RDA1, y = RDA2)) +
+  geom_point(aes(colour = severity_class_ha_rev), size = 3, alpha = 0.7) +
+  geom_segment(data = dplyr::filter(env_sc, group == "environment"),
+               aes(x = 0, y = 0, xend = RDA1, yend = RDA2),
+               arrow = arrow(length = unit(0.25, "cm")),
+               colour = group_cols["environment"], linewidth = 0.8, alpha = 0.5) +
+  geom_text_repel(data = dplyr::filter(env_sc, group == "environment"),
+                  aes(x = RDA1, y = RDA2, label = label),
+                  colour = group_cols["environment"], fontface = "bold", size = 5.5,
+                  max.overlaps = Inf, box.padding = 0.5,
+                  point.padding = 0.3, min.segment.length = 0, seed = 42) +
+  geom_segment(data = dplyr::filter(env_sc, group == "vegetation"),
+               aes(x = 0, y = 0, xend = RDA1, yend = RDA2),
+               arrow = arrow(length = unit(0.25, "cm")),
+               colour = group_cols["vegetation"], linewidth = 0.8, alpha = 0.5) +
+  geom_text_repel(data = dplyr::filter(env_sc, group == "vegetation"),
+                  aes(x = RDA1, y = RDA2, label = label),
+                  colour = group_cols["vegetation"], fontface = "bold", size = 5.5,
+                  max.overlaps = Inf, box.padding = 0.5,
+                  point.padding = 0.3, min.segment.length = 0, seed = 42) +
+  geom_segment(data = dplyr::filter(env_sc, group == "fire"),
+               aes(x = 0, y = 0, xend = RDA1, yend = RDA2),
+               arrow = arrow(length = unit(0.25, "cm")),
+               colour = group_cols["fire"], linewidth = 0.8, alpha = 0.5) +
+  geom_text_repel(data = dplyr::filter(env_sc, group == "fire"),
+                  aes(x = RDA1, y = RDA2, label = label),
+                  colour = group_cols["fire"], fontface = "bold", size = 5.5,
+                  max.overlaps = Inf, box.padding = 0.5,
+                  point.padding = 0.3, min.segment.length = 0, seed = 42) +
+  geom_segment(data = canopy_sc,
+               aes(x = 0, y = 0, xend = RDA1, yend = RDA2),
+               arrow = arrow(length = unit(0.25, "cm")),
+               colour = group_cols["vegetation"], linewidth = 0.8, alpha = 0.7, linetype = "dashed") +
+  geom_text_repel(data = canopy_sc,
+                  aes(x = RDA1, y = RDA2, label = label),
+                  colour = group_cols["vegetation"], fontface = "bold", size = 5.5,
+                  max.overlaps = Inf, box.padding = 0.5,
+                  point.padding = 0.3, min.segment.length = 0, seed = 42) +
+  geom_text_repel(data = sp_sc,
+                  aes(x = RDA1, y = RDA2, label = label),
+                  colour = "black", fontface = "bold", size = 5,
+                  max.overlaps = Inf, box.padding = 0.6,
+                  point.padding = 0.3, min.segment.length = 0, seed = 42,
+                  force = 3, force_pull = 0.5, max.iter = 50000, max.time = 2,
+                  nudge_x = sp_sc$nudge_x, nudge_y = sp_sc$nudge_y) +
+  scale_fill_manual(values = fire_cols, labels = c("control" = "unburned")) +
+  scale_colour_manual(values = fire_cols, labels = c("control" = "unburned")) +
+  labs(x = ax1, y = ax2,
+       colour = "Fire class", fill = "Fire class",
+       title = "Hellinger RDA",
+       subtitle = paste0("Adj. R² = ", round(r2$adj.r.squared, 3),
+                         "  |  arrows: blue = environment, green = vegetation, red = fire")) +
+  theme(
+    axis.title       = element_text(size = 14, face = "bold", colour = "black"),
+    axis.text        = element_text(size = 14, colour = "black"),
+    panel.background = element_blank(),
+    panel.border     = element_rect(fill = NA, colour = "black"),
+    legend.key       = element_blank(),
+    legend.title     = element_text(size = 19, face = "bold", colour = "black"),
+    legend.text      = element_text(size = 18, colour = "black")
+  ) + ylim(-0.7, 0.7) + xlim(-1, 0.8)
+ggsave(file.path(figures_dir, paste0("rda_vif_elimination_envfit", placeholder, ".png")), width = 300, height = 200, units = "mm", dpi = 500)
+```
+
+## Expected richness by RDA1 site group
+
+These supplementary figures show the mean +/- SD and sample variance of
+summed site-level occupancy for the four squirrels and the four
+omnivore-carnivores, using the -0.1 and +0.1 boundaries. Calculations and CSV
+tables are in `01_analysis.Rmd`; this chunk only plots the saved summaries.
+
+```{r rda1-richness-figures}
+if (is.null(analysis_results$rda1_richness_results)) {
+  message("Run rda1-richness-summaries and save-results in 01_analysis.Rmd to add the RDA1 plots.")
+} else {
+make_rda1_richness_figure <- function(summary_table, species_set) {
+  axis_labels <- setNames(
+    paste0(c("RDA1 < \u22120.1", "\u22120.1 \u2264 RDA1 \u2264 0.1", "RDA1 > 0.1"),
+           "\n(n = ", summary_table$n_sites, " sites)"),
+    levels(summary_table$RDA1_group)
+  )
+  make_panel <- function(value, title, y_label, digits, sd_values = NULL) {
+    plot_data <- data.frame(group = summary_table$RDA1_group, value = value)
+    plot_data$label_y <- value
+    plot_data$value_label <- sprintf(paste0("%.", digits, "f"), value)
+    if (!is.null(sd_values)) {
+      plot_data$sd <- sd_values
+      plot_data$label_y <- value + sd_values
+      plot_data$value_label <- sprintf("%.3f \u00b1 %.3f", value, sd_values)
+    }
+    p <- ggplot2::ggplot(plot_data, ggplot2::aes(x = group, y = value)) +
+      ggplot2::geom_col(width = 0.56, fill = species_set$colour)
+    if (!is.null(sd_values)) {
+      p <- p + ggplot2::geom_errorbar(
+        ggplot2::aes(ymin = value - sd, ymax = value + sd),
+        width = 0.16, linewidth = 0.6, colour = "black"
+      )
+    }
+    p +
+      ggplot2::geom_text(ggplot2::aes(y = label_y, label = value_label),
+                         vjust = -0.6, size = 4.5, colour = "black") +
+      ggplot2::scale_x_discrete(labels = axis_labels) +
+      ggplot2::scale_y_continuous(limits = c(0, NA),
+                                 expand = ggplot2::expansion(mult = c(0, 0.15))) +
+      ggplot2::labs(title = title, x = "Site group based on RDA1", y = y_label) +
+      ggplot2::theme_classic(base_size = 12) +
+      ggplot2::theme(
+        plot.title = ggplot2::element_text(face = "bold", size = 15,
+                                           margin = ggplot2::margin(b = 14)),
+        axis.title = ggplot2::element_text(size = 12, colour = "black"),
+        axis.title.x = ggplot2::element_text(margin = ggplot2::margin(t = 12)),
+        axis.title.y = ggplot2::element_text(margin = ggplot2::margin(r = 10)),
+        axis.text = ggplot2::element_text(size = 10.5, colour = "black"),
+        axis.ticks.x = ggplot2::element_blank(),
+        plot.margin = ggplot2::margin(12, 14, 12, 12)
+      )
+  }
+  mean_panel <- make_panel(
+    summary_table$mean_expected_richness, "a) Mean \u00b1 SD",
+    paste("Mean expected", species_set$axis_name, "richness"), 3,
+    sd_values = summary_table$standard_deviation
+  )
+  variance_panel <- make_panel(
+    summary_table$sample_variance_expected_richness, "b) Variance",
+    paste("Variance in expected", species_set$axis_name, "richness"), 4
+  )
+  figure <- patchwork::wrap_plots(mean_panel, variance_panel, ncol = 2) +
+    patchwork::plot_annotation(title = species_set$title,
+                               theme = ggplot2::theme(plot.title = ggplot2::element_text(
+                                 face = "bold", size = 16)))
+
+  figure
+}
+for (key in names(analysis_results$rda1_richness_results)) {
+  summary_table <- analysis_results$rda1_richness_results[[key]]$summary
+  species_set <- analysis_results$rda1_species_sets[[key]]
+  figure <- make_rda1_richness_figure(summary_table, species_set)
+  prefix <- file.path(figures_dir, paste0(key, "_occupancy_by_RDA1_threshold_0p1"))
+  ggsave(paste0(prefix, "_mean_variance.png"), plot = figure, device = ragg::agg_png,
+         width = 300, height = 150, units = "mm", dpi = 500, bg = "white")
+  print(figure)
+}
+}
+```
+
+## Variance partitioning
+
+```{r variance-partitioning}
+png(file.path(figures_dir, paste0("varpart_plot", placeholder, ".png")), width = 2300, height = 1600, res = 300)
+plot(
+  vp,
+  bg = c("lightblue", "lightcoral", "lightgreen"),
+  Xnames = c("Environment", "Fire Dynamics", "Vegetation")
+)
+dev.off()
+```
+
+```{r variance-partitioning-understory-overstory}
+png(file.path(figures_dir, paste0("varpart_plot_os_us", placeholder, ".png")), width = 2300, height = 1600, res = 300)
+plot(
+  vp3,
+  bg = c("lightblue", "lightcoral", "lightgreen", "lightyellow"),
+  Xnames = c("Environment", "Fire Dynamics", "us", "os")
+)
+dev.off()
+```
+
+
+## Uncertainty simulation figures
+
+To redraw only simulation 3, change `simulation_ids <- seq_len(n_sims)` to `simulation_ids <- 3`. These loops only draw saved results.
+
+```{r simulation-nmds}
+simulation_ids <- seq_len(n_sims)
+for (i in simulation_ids) {
+  nmds_i <- nmds_sims[[i]]$nmds
+  site_scores_i <- nmds_sims[[i]]$site_scores
+  species_scores_i <- nmds_sims[[i]]$sp_scores
+  species_scores_i$species <- display_species_name(species_scores_i$species)
+  hull_i <- nmds_sims[[i]]$hull
+  en_i <- nmds_sims[[i]]$envfit_cov
+  en_fu_i <- nmds_sims[[i]]$envfit_func
+  en_ev_i <- nmds_sims[[i]]$envfit_env
+  en_arr_i <- as.data.frame(scores(en_i, "vectors")) * manuscript_arrow_multiplier(en_i)
+  en_arr_i$label <- ifelse(
+    rownames(en_arr_i) %in% names(label_lookup),
+    label_lookup[rownames(en_arr_i)],
+    gsub("\\.", " ", rownames(en_arr_i))
+  )
+  en_arr_fu_i <- as.data.frame(scores(en_fu_i, "vectors")) * manuscript_arrow_multiplier(en_fu_i)
+  en_arr_fu_i$label <- func_labels[rownames(en_arr_fu_i)]
+  en_arr_ev_i <- as.data.frame(scores(en_ev_i, "vectors")) * manuscript_arrow_multiplier(en_ev_i)
+  en_arr_ev_i$label <- ifelse(
+    rownames(en_arr_ev_i) %in% names(label_lookup),
+    label_lookup[rownames(en_arr_ev_i)],
+    rownames(en_arr_ev_i)
+  )
+
+  sim_title <- paste0("Sim ", i, "  (stress = ", round(nmds_i$stress, 3), ")")
+
+  p_hull <- ggplot(site_scores_i, aes(x = NMDS1, y = NMDS2)) +
+    geom_point(aes(colour = severity_class_ha_rev), size = 3, alpha = 0.5) +
+    geom_text(data = species_scores_i, aes(label = species), size = 3) +
+    geom_polygon(data = hull_i,
+                 aes(x = NMDS1, y = NMDS2, fill = severity_class_ha_rev, group = severity_class_ha_rev),
+                 alpha = 0.30) +
+    scale_fill_manual(values = fire_colours, labels = c("control" = "unburned")) +
+    scale_colour_manual(values = fire_colours, labels = c("control" = "unburned")) +
+    theme(
+      axis.title       = element_text(size = 14, face = "bold", colour = "black"),
+      axis.text        = element_text(size = 14, colour = "black"),
+      panel.background = element_blank(),
+      panel.border     = element_rect(fill = NA, colour = "black"),
+      legend.key       = element_blank(),
+      legend.title     = element_text(size = 19, face = "bold", colour = "black"),
+      legend.text      = element_text(size = 18, colour = "black")
+    ) +
+    labs(colour = "Fire class", fill = "Fire class")
+  print(p_hull)
+  ggsave(file.path(figures_dir, paste0("simulations/sim_NMDS12_convex_sim", i, ".png")),
+         width = 300, height = 150, units = "mm", dpi = 500)
+
+  p_cov <- ggplot(site_scores_i, aes(x = NMDS1, y = NMDS2)) +
+    geom_point(aes(colour = severity_class_ha_rev), size = 3, alpha = 0.5) +
+    geom_segment(data = en_arr_i,
+                 aes(x = 0, y = 0, xend = NMDS1, yend = NMDS2),
+                 size = 1, alpha = 0.5, colour = "darkblue") +
+    geom_text_repel(data = en_arr_i,
+                    aes(label = label),
+                    colour = "darkblue", fontface = "bold") +
+    geom_text_repel(data = species_scores_i, aes(label = species), size = 3) +
+    scale_colour_manual(values = fire_colours, labels = c("control" = "unburned")) +
+    theme(
+      axis.title       = element_text(size = 14, face = "bold", colour = "black"),
+      axis.text        = element_text(size = 14, colour = "black"),
+      panel.background = element_blank(),
+      panel.border     = element_rect(fill = NA, colour = "black"),
+      legend.key       = element_blank(),
+      legend.title     = element_text(size = 19, face = "bold", colour = "black"),
+      legend.text      = element_text(size = 18, colour = "black")
+    ) +
+    labs(colour = "Fire class", title = paste("NMDS1 and 2 -- OG covariates --", sim_title))
+  print(p_cov)
+  ggsave(file.path(figures_dir, paste0("simulations/sim_NMDS12_cova_sim", i, ".png")),
+         width = 300, height = 150, units = "mm", dpi = 500)
+
+  p_func <- ggplot(site_scores_i, aes(x = NMDS1, y = NMDS2)) +
+    geom_point(aes(colour = severity_class_ha_rev), size = 3, alpha = 0.5) +
+    geom_segment(data = en_arr_fu_i,
+                 aes(x = 0, y = 0, xend = NMDS1, yend = NMDS2),
+                 size = 1, alpha = 0.5, colour = "darkblue") +
+    geom_text_repel(data = en_arr_fu_i,
+                    aes(label = label),
+                    colour = "darkblue", fontface = "bold") +
+    geom_text_repel(data = species_scores_i, aes(label = species), size = 3) +
+    scale_colour_manual(values = fire_colours, labels = c("control" = "unburned")) +
+    theme(
+      axis.title       = element_text(size = 14, face = "bold", colour = "black"),
+      axis.text        = element_text(size = 14, colour = "black"),
+      panel.background = element_blank(),
+      panel.border     = element_rect(fill = NA, colour = "black"),
+      legend.key       = element_blank(),
+      legend.title     = element_text(size = 19, face = "bold", colour = "black"),
+      legend.text      = element_text(size = 18, colour = "black")
+    ) +
+    labs(colour = "Fire class", title = paste("NMDS1 and 2 -- functional groups --", sim_title))
+  print(p_func)
+  ggsave(file.path(figures_dir, paste0("simulations/sim_NMDS12_func_sim", i, ".png")),
+         width = 300, height = 150, units = "mm", dpi = 500)
+
+  p_env <- ggplot(site_scores_i, aes(x = NMDS1, y = NMDS2)) +
+    geom_point(aes(colour = severity_class_ha_rev), size = 3, alpha = 0.5) +
+    geom_segment(data = en_arr_ev_i,
+                 aes(x = 0, y = 0, xend = NMDS1, yend = NMDS2),
+                 size = 1, alpha = 0.5, colour = "darkblue") +
+    geom_text_repel(data = en_arr_ev_i,
+                    aes(label = label),
+                    colour = "darkblue", fontface = "bold") +
+    geom_text_repel(data = species_scores_i, aes(label = species), size = 3) +
+    scale_colour_manual(values = fire_colours, labels = c("control" = "unburned")) +
+    theme(
+      axis.title       = element_text(size = 14, face = "bold", colour = "black"),
+      axis.text        = element_text(size = 14, colour = "black"),
+      panel.background = element_blank(),
+      panel.border     = element_rect(fill = NA, colour = "black"),
+      legend.key       = element_blank(),
+      legend.title     = element_text(size = 19, face = "bold", colour = "black"),
+      legend.text      = element_text(size = 18, colour = "black")
+    ) +
+    labs(colour = "Fire class", title = paste("NMDS1 and 2 -- env variables --", sim_title))
+  print(p_env)
+  ggsave(file.path(figures_dir, paste0("simulations/sim_NMDS12_env_sim", i, ".png")),
+         width = 300, height = 150, units = "mm", dpi = 500)
+}
+```
+
+```{r simulation-rda}
+simulation_ids <- seq_len(n_sims)
+for (i in simulation_ids) {
+  rda_i <- rda_sims[[i]]$rda
+  site_sc_i <- rda_sims[[i]]$site_scores
+  sp_sc_i <- rda_sims[[i]]$sp_scores
+  env_sc_i <- rda_sims[[i]]$env_scores
+  r2_i <- rda_sims[[i]]$r2
+  env_sc_i$label <- ifelse(
+    rownames(env_sc_i) %in% names(label_lookup),
+    label_lookup[rownames(env_sc_i)],
+    rownames(env_sc_i)
+  )
+  env_sc_i$group <- var_group(rownames(env_sc_i))
+  sp_sc_i$label <- gsub("_", " ", rownames(sp_sc_i))
+  hull_rda_i <- site_sc_i %>%
+    dplyr::group_by(severity_class_ha_rev) %>%
+    dplyr::slice(chull(RDA1, RDA2))
+
+  eig_c_i <- rda_i$CCA$eig
+  tot_i_i <- rda_i$tot.chi
+  pct1_i  <- round(100 * eig_c_i[1] / tot_i_i, 1)
+  pct2_i  <- round(100 * eig_c_i[2] / tot_i_i, 1)
+  ax1_i   <- paste0("RDA1 (", pct1_i, "% of total inertia)")
+  ax2_i   <- paste0("RDA2 (", pct2_i, "% of total inertia)")
+
+  sim_title <- paste0("Sim ", i, "  (Adj. R² = ", round(r2_i$adj.r.squared, 3), ")")
+  p_rda <- ggplot(site_sc_i, aes(x = RDA1, y = RDA2)) +
+    geom_polygon(data = hull_rda_i,
+                 aes(fill = severity_class_ha_rev, group = severity_class_ha_rev),
+                 alpha = 0.25) +
+    geom_point(aes(colour = severity_class_ha_rev), size = 3, alpha = 0.7) +
+    geom_segment(data = dplyr::filter(env_sc_i, group == "environment"),
+                 aes(x = 0, y = 0, xend = RDA1, yend = RDA2),
+                 arrow = arrow(length = unit(0.25, "cm")),
+                 colour = group_cols["environment"], linewidth = 0.8, alpha = 0.7) +
+    geom_text_repel(data = dplyr::filter(env_sc_i, group == "environment"),
+                    aes(x = RDA1, y = RDA2, label = label),
+                    colour = group_cols["environment"], fontface = "bold", size = 5.5,
+                    max.overlaps = Inf, box.padding = 0.5,
+                    point.padding = 0.3, min.segment.length = 0, seed = 42) +
+    geom_segment(data = dplyr::filter(env_sc_i, group == "vegetation"),
+                 aes(x = 0, y = 0, xend = RDA1, yend = RDA2),
+                 arrow = arrow(length = unit(0.25, "cm")),
+                 colour = group_cols["vegetation"], linewidth = 0.8, alpha = 0.7) +
+    geom_text_repel(data = dplyr::filter(env_sc_i, group == "vegetation"),
+                    aes(x = RDA1, y = RDA2, label = label),
+                    colour = group_cols["vegetation"], fontface = "bold", size = 5.5,
+                    max.overlaps = Inf, box.padding = 0.5,
+                    point.padding = 0.3, min.segment.length = 0, seed = 42) +
+    geom_segment(data = dplyr::filter(env_sc_i, group == "fire"),
+                 aes(x = 0, y = 0, xend = RDA1, yend = RDA2),
+                 arrow = arrow(length = unit(0.25, "cm")),
+                 colour = group_cols["fire"], linewidth = 0.8, alpha = 0.7) +
+    geom_text_repel(data = dplyr::filter(env_sc_i, group == "fire"),
+                    aes(x = RDA1, y = RDA2, label = label),
+                    colour = group_cols["fire"], fontface = "bold", size = 5.5,
+                    max.overlaps = Inf, box.padding = 0.5,
+                    point.padding = 0.3, min.segment.length = 0, seed = 42) +
+    geom_text_repel(data = sp_sc_i,
+                    aes(x = RDA1, y = RDA2, label = label),
+                    colour = "black", fontface = "bold", size = 5,
+                    max.overlaps = Inf, box.padding = 0.5,
+                    point.padding = 0.3, min.segment.length = 0, seed = 42) +
+    scale_fill_manual(values = fire_cols, labels = c("control" = "unburned")) +
+    scale_colour_manual(values = fire_cols, labels = c("control" = "unburned")) +
+    labs(x = ax1_i, y = ax2_i,
+         colour = "Fire class", fill = "Fire class",
+         title = paste("Hellinger RDA --", sim_title)) +
+    theme(
+      axis.title       = element_text(size = 14, face = "bold", colour = "black"),
+      axis.text        = element_text(size = 14, colour = "black"),
+      panel.background = element_blank(),
+      panel.border     = element_rect(fill = NA, colour = "black"),
+      legend.key       = element_blank(),
+      legend.title     = element_text(size = 19, face = "bold", colour = "black"),
+      legend.text      = element_text(size = 18, colour = "black")
+    )
+  print(p_rda)
+  ggsave(file.path(figures_dir, paste0("simulations/10pred_sim_RDA12_sim", i, "2.png")),
+         width = 300, height = 200, units = "mm", dpi = 500)
+}
+```
+
+```{r simulation-variance-partitioning}
+simulation_ids <- seq_len(n_sims)
+for (i in simulation_ids) {
+  vp_i <- vp_sims[[i]]
+  png(file.path(figures_dir, paste0("simulations/varpart_sim", i, ".png")), width = 2300, height = 1600, res = 300)
+  plot(vp_i, bg = c("lightblue", "lightcoral", "lightgreen"),
+       Xnames = c("Environment", "Fire Dynamics", "Vegetation"))
+  dev.off()
+}
+```
+
+## Study-area summaries and diagnostics
+
+```{r sites-by-zone}
+ggplot(ncs_fc, aes(x = factor(severity_class_ha_rev, levels = c("control", "low", "lowlow", "mod", "modplus")), fill = Zone)) +
+  geom_bar(position = "stack", colour = "black") +
+  scale_x_discrete(labels = c("control" = "unburned")) +
+  scale_fill_manual(values = c("C" = "#4575B4", "N" = "#FEE08B", "S" = "#5bb450"),
+                    labels = c("C" = "Center", "N" = "North", "S" = "South")) +
+  labs(x = "Fire class", y = "Number of plots", fill = "Zone",
+       title = "Plot counts by fire class and zone") +
+  theme_bw() +
+  theme(
+    axis.title       = element_text(size = 22, face = "bold", colour = "black"),
+    axis.text        = element_text(size = 20, colour = "black"),
+    panel.background = element_blank(),
+    panel.border     = element_rect(fill = NA, colour = "black"),
+    legend.title     = element_text(size = 21, face = "bold", colour = "black"),
+    legend.text      = element_text(size = 20, colour = "black")
+  )
+ggsave(file.path(figures_dir, "ncs_by_fireclass_stackedbar.png"), width = 200, height = 150, units = "mm", dpi = 500)
+```
+
+```{r sites-by-elevation}
+ggplot(el97, aes(x = factor(severity_class_ha_rev, levels = c("control", "low", "lowlow", "mod", "modplus")), fill = elev_class)) +
+  geom_bar(position = "stack", colour = "black") +
+  scale_x_discrete(labels = c("control" = "unburned")) +
+  scale_fill_manual(values = c("Low" = "#4575B4", "Mid" = "#FEE08B", "High" = "#D73027")) +
+  labs(x = "Fire class", y = "Number of plots", fill = "Elevation",
+       title = "Plot counts by fire class and elevation") +
+  theme_bw() +
+  theme(
+    axis.title       = element_text(size = 22, face = "bold", colour = "black"),
+    axis.text        = element_text(size = 20, colour = "black"),
+    panel.background = element_blank(),
+    panel.border     = element_rect(fill = NA, colour = "black"),
+    legend.title     = element_text(size = 21, face = "bold", colour = "black"),
+    legend.text      = element_text(size = 20, colour = "black")
+  )
+ggsave(file.path(figures_dir, "elev_by_fireclass_stackedbar.png"), width = 200, height = 150, units = "mm", dpi = 500)
+```
+
+```{r covariate-correlations}
+png(file.path(figures_dir, "covariate_correlations.png"), width = 3000, height = 3000, res = 300)
+corrplot(cor_matrix, method = "number", type = "upper", tl.cex = 0.7)
+dev.off()
+```
+
+```{r dispersion-diagnostic}
+png(file.path(figures_dir, "dispersion_diagnostic.png"), width = 2300, height = 1600, res = 300)
+plot(dispersion)
+dev.off()
+```
+
